@@ -21,15 +21,54 @@ from vision.objects import _PROMPT_LABELS, PROMPTS, ObjectDetector, ObjectsThrea
 # Lives only in the main checkout, never in git. Frames from it stay in memory.
 INTERSECTION_CLIP = Path("/Users/luiz/Developer/privacy-cam/tests/data/intersection.mov")
 SAMPLE_EVERY = 10  # frames; the clip has about 320
-MIN_SHARE_WITH_DETECTIONS = 0.25  # PyTorch measured 21/33, NCNN at 320 px 12/33
+IGNORED_PROMPTS = {prompt for prompt, label in _PROMPT_LABELS.items() if label is None}
+
+# WP16 measurements, every 10th frame (33 frames). Before, "traffic sign" reported as
+# "street sign" on 19 frames, square stop/regulatory signs included. After, PyTorch at 640
+# finds 3 boxes, all wide blades high in the frame (w/h 2.7 to 3.3); NCNN at 320 finds none
+# at YOLOE_CONF (the same blades score 0.1 to 0.25 there).
+PYTORCH_MIN_SHARE_WITH_DETECTIONS = 0.2  # measured 9/33
+MAX_STREET_SIGN_BOXES = 8  # measured 3 PyTorch, 0 NCNN; was 29 PyTorch, 17 NCNN
+MIN_STREET_SIGN_ASPECT = 1.5  # a street-name blade is wide; stop and most regulatory signs are not
 
 
 # --- prompts ---------------------------------------------------------------
 
 
-def test_every_prompt_reports_a_contract_label_and_every_label_has_a_prompt() -> None:
-    assert set(_PROMPT_LABELS.values()) == set(OBJECT_CLASSES)
-    assert set(OBJECT_CLASSES) <= set(PROMPTS)
+def test_every_prompt_reports_a_contract_label_or_is_ignored_and_every_label_has_a_prompt() -> None:
+    assert set(_PROMPT_LABELS.values()) - {None} == set(OBJECT_CLASSES)
+    assert PROMPTS == tuple(_PROMPT_LABELS)
+
+
+def test_traffic_signs_are_ignored_and_street_signs_are_named_streets() -> None:
+    assert {"stop sign", "one way sign", "traffic light", "speed limit sign"} <= IGNORED_PROMPTS
+    street_prompts = [prompt for prompt, label in _PROMPT_LABELS.items() if label == "street sign"]
+    assert street_prompts and all("street name" in prompt for prompt in street_prompts)
+    assert "traffic sign" not in street_prompts
+
+
+class _FakeBoxes:
+    def __init__(self, rows: list[tuple[tuple[float, float, float, float], float, int]]) -> None:
+        self.xyxy = np.array([xyxy for xyxy, _, _ in rows], dtype=np.float32).reshape(-1, 4)
+        self.conf = np.array([conf for _, conf, _ in rows], dtype=np.float32)
+        self.cls = np.array([cls for _, _, cls in rows], dtype=np.float32)
+
+
+class _FakeModel:
+    """Returns one box per prompt, so every prompt's mapping is exercised."""
+
+    def predict(self, image: np.ndarray, **_kwargs) -> list:
+        rows = [((10.0 + i, 20.0, 80.0 + i, 40.0), 0.5, i) for i in range(len(PROMPTS))]
+        result = type("Result", (), {"names": dict(enumerate(PROMPTS)), "boxes": _FakeBoxes(rows)})()
+        return [result]
+
+
+def test_ignored_prompts_are_dropped_from_the_output() -> None:
+    detector = object.__new__(ObjectDetector)  # skip loading a real model
+    detector._model, detector._device, detector._imgsz, detector._conf = _FakeModel(), "cpu", 640, 0.25
+    detections = detector.detect(np.zeros((config.FRAME_HEIGHT, config.FRAME_WIDTH, 3), dtype=np.uint8))
+    assert len(detections) == len(PROMPTS) - len(IGNORED_PROMPTS)
+    assert {d.label for d in detections} == set(OBJECT_CLASSES)
 
 
 def test_the_ncnn_export_bakes_in_the_same_prompts() -> None:
@@ -57,35 +96,52 @@ def intersection_frames() -> list[np.ndarray]:
     return frames
 
 
-def _check_detections_on_clip(detector: ObjectDetector, frames: list[np.ndarray]) -> None:
-    frames_with_detections = 0
+def _check_detections_on_clip(detector: ObjectDetector, frames: list[np.ndarray]) -> tuple[int, list[tuple]]:
+    """Checks every box; returns (frames with any detection, street sign boxes)."""
+    frames_with_detections, street_signs = 0, []
     for image in frames:
         detections = detector.detect(image)
         frames_with_detections += bool(detections)
         for detection in detections:
             assert detection.label in OBJECT_CLASSES
+            assert detection.label not in IGNORED_PROMPTS
             x1, y1, x2, y2 = detection.xyxy
             assert all(isinstance(v, int) for v in detection.xyxy)
             assert 0 <= x1 < x2 <= config.FRAME_WIDTH and 0 <= y1 < y2 <= config.FRAME_HEIGHT
             assert config.YOLOE_CONF <= detection.conf <= 1.0
-    assert frames_with_detections >= MIN_SHARE_WITH_DETECTIONS * len(frames)
+        street_signs += [d.xyxy for d in detections if d.label == "street sign"]
+    return frames_with_detections, street_signs
 
 
-def test_pytorch_detector_finds_signs_and_plates_on_the_clip(intersection_frames: list[np.ndarray]) -> None:
+def _check_street_signs_are_wide_and_rare(street_signs: list[tuple]) -> None:
+    """Regression for WP16: no more square stop/regulatory signs reported as street signs."""
+    assert len(street_signs) <= MAX_STREET_SIGN_BOXES
+    wide = [(x2 - x1) / (y2 - y1) >= MIN_STREET_SIGN_ASPECT for x1, y1, x2, y2 in street_signs]
+    assert sum(wide) >= 0.8 * len(wide)
+
+
+def test_pytorch_detector_finds_street_name_signs_and_plates_on_the_clip(intersection_frames: list[np.ndarray]) -> None:
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(config, "YOLOE_RUNTIME", "pytorch")
         detector = ObjectDetector()
-    _check_detections_on_clip(detector, intersection_frames)
+    frames_with_detections, street_signs = _check_detections_on_clip(detector, intersection_frames)
+    assert frames_with_detections >= PYTORCH_MIN_SHARE_WITH_DETECTIONS * len(intersection_frames)
+    assert street_signs, "the street-name blades on the clip are no longer found"
+    _check_street_signs_are_wide_and_rare(street_signs)
 
 
-def test_ncnn_export_loads_and_finds_signs_and_plates_on_the_clip(intersection_frames: list[np.ndarray]) -> None:
-    """Slow-tolerant: NCNN on the Mac CPU. Skipped until scripts/export_ncnn.py has run."""
+def test_ncnn_export_loads_and_reports_only_contract_labels_on_the_clip(intersection_frames: list[np.ndarray]) -> None:
+    """Slow-tolerant: NCNN on the Mac CPU. Skipped until scripts/export_ncnn.py has run.
+
+    No minimum detection count: at 320 px nothing on this clip clears YOLOE_CONF (measured 0/33).
+    """
     if not Path(config.YOLOE_NCNN_MODEL).is_dir():
         pytest.skip("no NCNN export; run scripts/export_ncnn.py")
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(config, "YOLOE_RUNTIME", "ncnn")
         detector = ObjectDetector()
-    _check_detections_on_clip(detector, intersection_frames)
+    _, street_signs = _check_detections_on_clip(detector, intersection_frames)
+    _check_street_signs_are_wide_and_rare(street_signs)
 
 
 # --- the objects thread, with a fake detector ------------------------------

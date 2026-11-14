@@ -3,7 +3,9 @@
     python scripts/export_ncnn.py
 
 Needs the `ncnn` and `pnnx==20260526` packages (ultralytics' NCNN exporter pins that pnnx).
-The model is the detect-only head with vision.objects.PROMPTS baked in as its classes.
+The model is the detect-only head with vision.objects.PROMPTS baked in as its classes,
+distractor prompts included: vision.objects drops their boxes at run time, on both runtimes.
+tests/test_objects.py checks that the export's names equal PROMPTS.
 """
 
 from __future__ import annotations
