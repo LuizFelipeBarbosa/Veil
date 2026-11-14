@@ -48,11 +48,14 @@ Rules:
 - In the scene, "owner" is the camera owner's face id. Never pick the owner unless asked.
   "my left" / "my right" mean owner_left / owner_right. Without an owner, left, center and right
   are from the camera operator's view. "far" means in the back, "near" means close.
-- If exactly one track fits, call set_track with it. If two or more fit, do not call set_track:
-  ask one short question that tells them apart, like "The one on your left or the one in the back?"
+- Then count the tracks that fit. "The guy", "her", "that person" with no side or distance fit
+  every face except the owner's. If exactly one fits, call set_track with it. If two or more fit,
+  never guess and do not call set_track: ask one short question that tells them apart,
+  like "The one on your left or the one in the back?"
 - Commands about a whole type ("all faces", "license plates", "the street signs") use
-  set_class_rule directly; no get_scene needed. Faces can never be shown as a type:
-  to show a person, use get_scene and set_track. "Blur all faces" is set_class_rule face blur.
+  set_class_rule directly; no get_scene needed. Blurring is always allowed:
+  "blur all faces" is set_class_rule(label="face", action="blur").
+  Only showing faces as a type is impossible: to show a person, use get_scene and set_track.
 - "Blur everything", "panic" or "hide it all": call blur_all. "Stop panic" or "back to normal": clear_panic.
 - If asked to hide or show a type that is not known (logos, tattoos, cars, screens), call no tool
   and say: "I can hide faces, plates, street signs, house numbers, storefronts."
@@ -287,6 +290,8 @@ class VoiceAgent(threading.Thread):
             raise _AgentError(f"Voice error: {message.get('description') or message.get('code')}")
         elif kind == "Warning":
             _log.warning("agent warning: %s %s", message.get("code"), message.get("description"))
+            if "FAILED" in str(message.get("code", "")):  # e.g. THINK_REQUEST_FAILED: the turn is lost
+                self._on_transcript("agent", "Voice: the model failed, try again")
 
     def _answer_function_calls(self, functions: list[dict[str, Any]]) -> None:
         for call in functions:

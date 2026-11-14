@@ -66,7 +66,7 @@ CASES = [
     Case("signs_and_plate", "Unblur the plate on the right.", (GET_SCENE, _track("obj#3", "show"))),
     Case("signs_and_plate", "Show the sign on the left.", (GET_SCENE, _track("obj#1", "show"))),
     Case("empty", "Hide the tattoos.", (), lists_types=True),
-    Case("owner_and_friend_left", "Blur the person on my left again.", (GET_SCENE, _track("face#7", "blur"))),
+    Case("owner_and_friend_left", "Blur my face too.", (GET_SCENE, _track("face#2", "blur"))),
     Case("empty", "Pixelate the house numbers.", (_rule("house number", "blur"),)),
     Case("signs_and_plate", "Unblur the license plates.", (_rule("license plate", "show"),)),
 ]
@@ -189,7 +189,7 @@ def check_model(overrides: dict[str, Any]) -> tuple[int, list[float], list[float
 
 
 def _calls_text(calls: Any) -> str:
-    return ", ".join(f"{name}({', '.join(f'{v}' for v in args.values())})" for name, args in calls)
+    return ", ".join(f"{name}({', '.join(f'{k}={v}' for k, v in sorted(args.items()))})" for name, args in calls)
 
 
 def _ms(value: float | None) -> str:
