@@ -1,28 +1,39 @@
-"""Tool handlers and the keyword fallback (WP7). Schemas come from contracts.TOOL_SCHEMAS."""
+"""Tool handlers and the keyword fallback (WP7, WP21). Schemas come from contracts.TOOL_SCHEMAS."""
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 import re
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
-from contracts import ACTIONS, FACE, KNOWN_CLASSES, Policy, Scene
+import config
+from contracts import ACTIONS, AD_CLASSES, FACE, KNOWN_CLASSES, Policy, Scene
 
 _log = logging.getLogger(__name__)
 
+# The refusal when there is nothing to replace ads with; the keyword fallback says it out loud.
+NO_AD_IMAGES = "There are no ad images on the device."
+
 
 class ToolHandlers:
-    """Runs the 6 client-side tools against the local Policy and the live Scene."""
+    """Runs the 7 client-side tools against the local Policy and the live Scene."""
 
-    def __init__(self, policy: Policy, get_scene: Callable[[], Scene]) -> None:
+    def __init__(self, policy: Policy, get_scene: Callable[[], Scene], ad_assets: Sequence[str] = ()) -> None:
+        """ad_assets: the image file names in config.ADS_DIR, the only things an ad can be replaced with."""
         self._policy = policy
         self._get_scene = get_scene
+        self._ad_assets = tuple(ad_assets)
+
+    @property
+    def ad_assets(self) -> tuple[str, ...]:
+        return self._ad_assets
 
     def handle(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         """Run one tool and return its JSON-ready result.
 
-        Never raises: a refusal (unknown tool or label, face/show, track not in
+        Never raises: a refusal (unknown tool, label or ad image, track not in
         the live scene) comes back as {"ok": False, "error": "..."}.
         """
         try:
@@ -33,6 +44,8 @@ class ToolHandlers:
                 return self._set_class_rule(arguments)
             if name == "set_track":
                 return self._set_track(arguments)
+            if name == "set_replacement":
+                return self._set_replacement(arguments)
             if name == "blur_all":
                 self._policy.set_panic(True)
                 return {"ok": True, "panic": True}
@@ -69,15 +82,48 @@ class ToolHandlers:
         self._policy.set_track_override(track_id, action)  # type: ignore[arg-type]
         return {"ok": True, "track_id": track_id, "action": action}
 
+    def _set_replacement(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        label = _string_argument(arguments, "label").strip().lower()
+        requested = _string_argument(arguments, "asset")
+        if label not in AD_CLASSES:
+            return _refuse(f"only ads can be replaced ({', '.join(AD_CLASSES)}), not {label!r}")
+        if not self._ad_assets:
+            return _refuse(NO_AD_IMAGES)
+        asset = _find_asset(requested, self._ad_assets)
+        if asset is None:
+            return _refuse(f"no single ad image matches {requested!r}; use one of: {', '.join(self._ad_assets)}")
+        self._policy.set_replacement(label, asset)
+        return {"ok": True, "label": label, "asset": asset}
+
     def _show_all(self) -> dict[str, Any]:
         self._policy.show_all()
+        class_rules = self._policy.snapshot().class_rules
         return {
             "ok": True,
-            "classes_shown": list(KNOWN_CLASSES),
+            "classes_shown": [label for label in KNOWN_CLASSES if class_rules[label] == "show"],
             "panic": False,
             "note": "everything stays unblurred, including people who arrive later; "
-            "things blurred one by one stay blurred",
+            "things blurred one by one stay blurred and replaced ads stay replaced",
         }
+
+
+def _find_asset(requested: str, ad_assets: tuple[str, ...]) -> str | None:
+    """The device's file name for a requested ad image, or None when none or several match.
+
+    An exact name (ignoring case) wins; otherwise the extension, case, "-" and "_" don't matter,
+    so "Summer Sale" finds summer_sale.png.
+    """
+    exact = [asset for asset in ad_assets if asset.casefold() == requested.strip().casefold()]
+    loose = [asset for asset in ad_assets if _asset_key(asset) == _asset_key(requested)]
+    matches = exact or loose
+    return matches[0] if len(matches) == 1 else None
+
+
+def _asset_key(name: str) -> str:
+    stem, suffix = os.path.splitext(name.strip())
+    if suffix.lower() in config.AD_IMAGE_SUFFIXES:
+        name = stem
+    return " ".join(re.sub(r"[_-]+", " ", name.casefold()).split())
 
 
 def _refuse(error: str) -> dict[str, Any]:
@@ -139,7 +185,17 @@ _LABEL_PHRASES = {
     "storefront signs": "storefront sign", "storefront sign": "storefront sign",
     "storefronts": "storefront sign", "storefront": "storefront sign",
     "store signs": "storefront sign", "shop signs": "storefront sign",
+    "billboards": "billboard", "billboard": "billboard",
+    "posters": "poster", "poster": "poster",
+    "advertisements": "advertisement", "advertisement": "advertisement",
 }
+# Phrase -> every label it names: one each, and "ads" for all three ad classes.
+_LABEL_GROUPS: dict[str, tuple[str, ...]] = {
+    **{phrase: (label,) for phrase, label in _LABEL_PHRASES.items()},
+    **{phrase: AD_CLASSES for phrase in ("ads", "adverts", "advertising")},
+}
+_REPLACE_WORDS = {"replace", "swap"}
+_STOP_REPLACING_PHRASES = ("stop replacing", "stop swapping", "ads off", "adverts off")
 # show_all only when the whole command, minus these fillers, is one of the phrases below,
 # so "unblur all faces" (the face class) or "show all the signs" never becomes show_all.
 _SHOW_ALL_PHRASES = {
@@ -153,34 +209,68 @@ _NEGATION_WORDS = {"don't", "dont", "not", "never", "no", "stop"}
 _POSSESSIVE_WORDS = {"my", "his", "your", "their"}
 
 
-def parse_keywords(transcript: str) -> tuple[str, dict[str, Any]] | None:
-    """Map a transcript to (tool name, arguments) without the model, or None if nothing matches.
+def parse_keywords(transcript: str, ad_assets: Sequence[str] = ()) -> list[tuple[str, dict[str, Any]]]:
+    """Map a transcript to tool calls (name, arguments) without the model; [] if nothing matches.
 
-    Only class-wide, show-everything and panic commands; anything about a specific person
-    returns None, and so does a negated show ("don't show the plates") or "show my face".
+    Only class-wide, show-everything, panic and ad-replacement commands; anything about a specific
+    person returns [], and so does a negated show ("don't show the plates") or "show my face".
+    "Replace the ads" uses the ad image the command names, else the first of ad_assets.
     """
     if not isinstance(transcript, str):
-        return None
+        return []
     text = " ".join(re.sub(r"[^a-z0-9#' ]+", " ", transcript.lower()).split())
     words = set(text.split())
     if not words or words & _PERSON_WORDS or "#" in text:
-        return None
+        return []
 
     if _contains_phrase(text, _CLEAR_PANIC_PHRASES):
-        return ("clear_panic", {})
+        return [("clear_panic", {})]
     if _contains_phrase(text, _PANIC_PHRASES):
-        return ("blur_all", {})
+        return [("blur_all", {})]
+    groups = _label_groups_in(text)
+    if words & _REPLACE_WORDS or _contains_phrase(text, _STOP_REPLACING_PHRASES):
+        return _ad_calls(text, words, groups, tuple(ad_assets))
     if words & _SHOW_WORDS and words & (_NEGATION_WORDS | _POSSESSIVE_WORDS):
-        return None  # a misheard "don't", or "show my face", must never unblur everyone
+        return []  # a misheard "don't", or "show my face", must never unblur everyone
     if " ".join(word for word in text.split() if word not in _FILLER_WORDS) in _SHOW_ALL_PHRASES:
-        return ("show_all", {})
+        return [("show_all", {})]
 
-    labels = _labels_in(text)
     wants_blur, wants_show = bool(words & _BLUR_WORDS), bool(words & _SHOW_WORDS)
-    if len(labels) != 1 or wants_blur == wants_show:
-        return None  # nothing, or more than one thing, to act on
+    if len(groups) != 1 or wants_blur == wants_show:
+        return []  # nothing, or more than one thing, to act on
     action = "show" if wants_show else "blur"
-    return ("set_class_rule", {"label": labels.pop(), "action": action})
+    return [("set_class_rule", {"label": label, "action": action}) for label in groups.pop()]
+
+
+def _ad_calls(
+    text: str, words: set[str], groups: set[tuple[str, ...]], ad_assets: tuple[str, ...]
+) -> list[tuple[str, dict[str, Any]]]:
+    """Replace ads, or stop replacing them (show them again). [] for a negation or anything but ads."""
+    named = {label for group in groups for label in group}
+    if not named <= set(AD_CLASSES):
+        return []  # "replace the faces": the model explains why not
+    labels = [label for label in AD_CLASSES if label in named] or list(AD_CLASSES)
+    if _contains_phrase(text, _STOP_REPLACING_PHRASES):
+        return [("set_class_rule", {"label": label, "action": "show"}) for label in labels]
+    if not named or words & _NEGATION_WORDS:
+        return []
+    asset = _asset_named_in(text, ad_assets)
+    if asset is None:
+        return []
+    return [("set_replacement", {"label": label, "asset": asset}) for label in labels]
+
+
+def _asset_named_in(text: str, ad_assets: tuple[str, ...]) -> str | None:
+    """The ad image a command names, else the first one; None when it names one the device lacks.
+
+    "" when there are no images at all, so the handler refuses with NO_AD_IMAGES.
+    """
+    if not ad_assets:
+        return ""
+    named = [asset for asset in ad_assets if _contains_phrase(text, (_asset_key(asset),))]
+    if named:
+        return named[0]
+    return None if "with" in text.split() else ad_assets[0]  # "with pepsi" and no pepsi image
 
 
 def _contains_phrase(text: str, phrases: tuple[str, ...]) -> bool:
@@ -188,11 +278,11 @@ def _contains_phrase(text: str, phrases: tuple[str, ...]) -> bool:
     return any(f" {phrase} " in padded for phrase in phrases)
 
 
-def _labels_in(text: str) -> set[str]:
-    labels = set()
+def _label_groups_in(text: str) -> set[tuple[str, ...]]:
+    groups = set()
     remaining = f" {text} "
-    for phrase in sorted(_LABEL_PHRASES, key=len, reverse=True):
+    for phrase in sorted(_LABEL_GROUPS, key=len, reverse=True):
         if f" {phrase} " in remaining:
-            labels.add(_LABEL_PHRASES[phrase])
+            groups.add(_LABEL_GROUPS[phrase])
             remaining = remaining.replace(f" {phrase} ", " ")
-    return labels
+    return groups

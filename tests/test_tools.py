@@ -10,10 +10,10 @@ import time
 import pytest
 
 import config
-from contracts import FACE, KNOWN_CLASSES, OBJECT_CLASSES, Policy, Scene
+from contracts import AD_CLASSES, FACE, KNOWN_CLASSES, OBJECT_CLASSES, TOOL_NAMES, Policy, Scene
 from fakes import scenes
-from voice.dg_agent import VoiceAgent, build_settings
-from voice.tools import ToolHandlers, parse_keywords
+from voice.dg_agent import VoiceAgent, _Turn, build_settings
+from voice.tools import NO_AD_IMAGES, ToolHandlers, parse_keywords
 
 
 def _handlers(scene: Scene = scenes.OWNER_AND_FRIEND_LEFT) -> tuple[ToolHandlers, Policy]:
@@ -277,7 +277,7 @@ def test_a_broken_scene_source_is_a_refusal() -> None:
     ],
 )
 def test_keyword_parser_matches(transcript: str, expected) -> None:
-    assert parse_keywords(transcript) == expected
+    assert parse_keywords(transcript) == [expected]
 
 
 @pytest.mark.parametrize(
@@ -303,37 +303,222 @@ def test_keyword_parser_matches(transcript: str, expected) -> None:
     ],
 )
 def test_keyword_parser_declines(transcript: str) -> None:
-    assert parse_keywords(transcript) is None
+    assert parse_keywords(transcript) == []
 
 
 def test_keyword_parser_never_turns_a_face_command_into_show_all() -> None:
     for verb in ("show", "unblur", "reveal", "unhide"):
         for noun in ("face", "faces", "all faces", "everyone", "all the faces"):
-            assert parse_keywords(f"{verb} {noun}") == ("set_class_rule", {"label": FACE, "action": "show"})
+            assert parse_keywords(f"{verb} {noun}") == [("set_class_rule", {"label": FACE, "action": "show"})]
 
 
 def test_keyword_parser_never_shows_one_person() -> None:
     for verb in ("show", "unblur", "reveal"):
         for who in ("her", "him", "the guy", "the person on my left", "face#7", "my face"):
-            assert parse_keywords(f"{verb} {who}") is None
+            assert parse_keywords(f"{verb} {who}") == []
 
 
 def test_keyword_parser_ignores_non_strings() -> None:
-    assert parse_keywords(None) is None  # type: ignore[arg-type]
+    assert parse_keywords(None) == []  # type: ignore[arg-type]
 
 
 def test_keyword_matches_run_through_the_handlers() -> None:
     handlers, policy = _handlers()
-    name, arguments = parse_keywords("hide license plates")
+    [(name, arguments)] = parse_keywords("hide license plates")
     assert handlers.handle(name, arguments)["ok"]
     assert policy.snapshot().class_rules["license plate"] == "blur"
 
 
 def test_keyword_show_all_runs_through_the_handlers() -> None:
     handlers, policy = _handlers(scenes.TWO_CANDIDATES)
-    name, arguments = parse_keywords("unblur everything")
+    [(name, arguments)] = parse_keywords("unblur everything")
     assert handlers.handle(name, arguments)["ok"]
     assert all(policy.snapshot().class_rules[label] == "show" for label in KNOWN_CLASSES)
+
+
+# --- ad replacement (WP21) ---
+
+ASSETS = ("summer_sale.png", "Coffee.jpg", "concert-poster.jpeg")
+
+
+def _ad_handlers(ad_assets: tuple[str, ...] = ASSETS) -> tuple[ToolHandlers, Policy]:
+    policy = Policy()
+    return ToolHandlers(policy, lambda: scenes.EMPTY, ad_assets=ad_assets), policy
+
+
+def _replace_all(asset: str) -> list:
+    return [("set_replacement", {"label": label, "asset": asset}) for label in AD_CLASSES]
+
+
+def _show_all_ads() -> list:
+    return [("set_class_rule", {"label": label, "action": "show"}) for label in AD_CLASSES]
+
+
+def test_set_replacement_replaces_an_ad_class() -> None:
+    handlers, policy = _ad_handlers()
+    result = handlers.handle("set_replacement", {"label": "poster", "asset": "summer_sale.png"})
+    assert result == {"ok": True, "label": "poster", "asset": "summer_sale.png"}
+    snapshot = policy.snapshot()
+    assert snapshot.class_rules["poster"] == "replace"
+    assert snapshot.replacements == {"poster": "summer_sale.png"}
+
+
+@pytest.mark.parametrize(
+    "requested, on_device",
+    [
+        ("Coffee.jpg", "Coffee.jpg"),
+        ("coffee.JPG", "Coffee.jpg"),
+        ("coffee", "Coffee.jpg"),
+        ("Summer Sale", "summer_sale.png"),
+        ("summer-sale.png", "summer_sale.png"),
+        ("concert poster", "concert-poster.jpeg"),
+    ],
+)
+def test_set_replacement_forgives_case_and_extension_but_stores_the_file_name(requested: str, on_device: str) -> None:
+    handlers, policy = _ad_handlers()
+    assert handlers.handle("set_replacement", {"label": "billboard", "asset": requested})["ok"]
+    assert policy.snapshot().replacements == {"billboard": on_device}
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {"label": "face", "asset": "coffee.jpg"},
+        {"label": "license plate", "asset": "coffee.jpg"},
+        {"label": "street sign", "asset": "coffee.jpg"},
+        {"label": "posters", "asset": "coffee.jpg"},
+        {"label": "poster", "asset": "pepsi.png"},
+        {"label": "poster", "asset": ""},
+        {"label": "poster", "asset": "../secret.png"},
+        {"label": "poster"},
+        {"asset": "coffee.jpg"},
+        {"label": "poster", "asset": 3},
+    ],
+)
+def test_set_replacement_refuses_and_changes_nothing(arguments: dict) -> None:
+    handlers, policy = _ad_handlers()
+    before = policy.to_dict()
+    result = handlers.handle("set_replacement", arguments)
+    assert result["ok"] is False and isinstance(result["error"], str)
+    assert policy.to_dict() == before
+
+
+def test_set_replacement_refuses_an_ambiguous_name() -> None:
+    handlers, policy = _ad_handlers(("sale.png", "sale.jpg"))
+    assert handlers.handle("set_replacement", {"label": "poster", "asset": "sale"})["ok"] is False
+    assert handlers.handle("set_replacement", {"label": "poster", "asset": "sale.jpg"})["ok"]
+    assert policy.snapshot().replacements == {"poster": "sale.jpg"}
+
+
+def test_set_replacement_without_assets_says_there_are_none() -> None:
+    handlers, policy = _ad_handlers(())
+    result = handlers.handle("set_replacement", {"label": "poster", "asset": "coffee.jpg"})
+    assert result == {"ok": False, "error": NO_AD_IMAGES}
+    assert policy.snapshot().replacements == {}
+
+
+def test_showing_a_replaced_class_turns_the_replacement_off() -> None:
+    handlers, policy = _ad_handlers()
+    assert handlers.handle("set_replacement", {"label": "billboard", "asset": "coffee"})["ok"]
+    assert handlers.handle("set_class_rule", {"label": "billboard", "action": "show"})["ok"]
+    snapshot = policy.snapshot()
+    assert snapshot.class_rules["billboard"] == "show" and snapshot.replacements == {}
+
+
+def test_show_all_keeps_replaced_ads_and_says_so() -> None:
+    handlers, policy = _ad_handlers()
+    assert handlers.handle("set_replacement", {"label": "poster", "asset": "coffee"})["ok"]
+    result = handlers.handle("show_all", {})
+    assert "poster" not in result["classes_shown"] and FACE in result["classes_shown"]
+    assert policy.snapshot().replacements == {"poster": "Coffee.jpg"}
+
+
+@pytest.mark.parametrize(
+    "transcript, expected",
+    [
+        ("Replace the ads.", _replace_all("summer_sale.png")),
+        ("replace ads", _replace_all("summer_sale.png")),
+        ("swap the adverts", _replace_all("summer_sale.png")),
+        ("replace the ads with coffee", _replace_all("Coffee.jpg")),
+        ("Replace the ads with the concert poster.", _replace_all("concert-poster.jpeg")),
+        ("replace the posters", [("set_replacement", {"label": "poster", "asset": "summer_sale.png"})]),
+        ("replace the billboards with summer sale",
+         [("set_replacement", {"label": "billboard", "asset": "summer_sale.png"})]),
+        ("Stop replacing the ads.", _show_all_ads()),
+        ("stop replacing", _show_all_ads()),
+        ("ads off", _show_all_ads()),
+        ("turn the ads off please", _show_all_ads()),
+        ("stop replacing the billboards", [("set_class_rule", {"label": "billboard", "action": "show"})]),
+        ("Show the ads.", _show_all_ads()),
+        ("show the real ads", _show_all_ads()),
+        ("blur the posters", [("set_class_rule", {"label": "poster", "action": "blur"})]),
+        ("hide the ads", [("set_class_rule", {"label": label, "action": "blur"}) for label in AD_CLASSES]),
+        ("show the billboards", [("set_class_rule", {"label": "billboard", "action": "show"})]),
+    ],
+)
+def test_keyword_parser_ad_commands(transcript: str, expected: list) -> None:
+    assert parse_keywords(transcript, ASSETS) == expected
+
+
+@pytest.mark.parametrize(
+    "transcript",
+    [
+        "replace the faces",
+        "replace the license plates",
+        "replace the ads with pepsi",
+        "don't replace the ads",
+        "never replace the posters",
+        "replace that one",
+        "replace",
+        "don't show the ads",
+        "replace the posters and the plates",
+    ],
+)
+def test_keyword_parser_declines_ad_commands(transcript: str) -> None:
+    assert parse_keywords(transcript, ASSETS) == []
+
+
+def test_keyword_replace_without_assets_is_refused_by_the_handler() -> None:
+    handlers, policy = _ad_handlers(())
+    calls = parse_keywords("replace the ads", handlers.ad_assets)
+    assert [name for name, _ in calls] == ["set_replacement"] * len(AD_CLASSES)
+    assert all(handlers.handle(name, arguments)["error"] == NO_AD_IMAGES for name, arguments in calls)
+    assert policy.snapshot().replacements == {}
+
+
+def test_keyword_ad_commands_run_through_the_handlers() -> None:
+    handlers, policy = _ad_handlers()
+    for name, arguments in parse_keywords("replace the ads", handlers.ad_assets):
+        assert handlers.handle(name, arguments)["ok"]
+    assert dict(policy.snapshot().replacements) == {label: "summer_sale.png" for label in AD_CLASSES}
+    for name, arguments in parse_keywords("stop replacing the ads", handlers.ad_assets):
+        assert handlers.handle(name, arguments)["ok"]
+    snapshot = policy.snapshot()
+    assert snapshot.replacements == {} and all(snapshot.class_rules[label] == "show" for label in AD_CLASSES)
+
+
+def test_keyword_fallback_replaces_ads_offline(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(config.DEEPGRAM_API_KEY_ENV, raising=False)
+    handlers, policy = _ad_handlers()
+    lines: list[tuple[str, str]] = []
+    agent = _offline_agent(handlers, lines)
+    agent._turn = _Turn(ended_at=0.0, user_text="replace the ads with coffee")
+    agent._run_keyword_fallback()
+    assert dict(policy.snapshot().replacements) == {label: "Coffee.jpg" for label in AD_CLASSES}
+    assert lines[-1] == ("agent", "Done.")
+    agent._loop.close()
+
+
+def test_keyword_fallback_says_there_are_no_ad_images(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(config.DEEPGRAM_API_KEY_ENV, raising=False)
+    handlers, policy = _ad_handlers(())
+    lines: list[tuple[str, str]] = []
+    agent = _offline_agent(handlers, lines)
+    agent._turn = _Turn(ended_at=0.0, user_text="replace the ads")
+    agent._run_keyword_fallback()
+    assert lines[-1] == ("agent", NO_AD_IMAGES)
+    assert policy.snapshot().replacements == {}
+    agent._loop.close()
 
 
 # --- settings (offline) ---
@@ -349,8 +534,8 @@ def test_settings_shape() -> None:
     assert "unblur" in listen["keyterms"]
     think = agent["think"]
     assert think["provider"]["type"] == "open_ai" and think["provider"]["temperature"] == 0
-    assert [f["name"] for f in think["functions"]] == [
-        "get_scene", "set_class_rule", "set_track", "blur_all", "clear_panic", "show_all",
+    assert [f["name"] for f in think["functions"]] == list(TOOL_NAMES) == [
+        "get_scene", "set_class_rule", "set_track", "set_replacement", "blur_all", "clear_panic", "show_all",
     ]
     assert all("endpoint" not in f for f in think["functions"])
     assert "get_scene" in think["prompt"]
@@ -358,7 +543,24 @@ def test_settings_shape() -> None:
     for label in KNOWN_CLASSES:
         assert label in think["prompt"]
     assert "show_all" in think["prompt"]
+    assert "no ad images on this device" in think["prompt"]
     assert f"under {config.AGENT_REPLY_MAX_WORDS} words" in think["prompt"]
+
+
+def test_settings_prompt_lists_the_ad_images() -> None:
+    prompt = build_settings(ad_assets=("summer_sale.png", "coffee.jpg"))["agent"]["think"]["prompt"]
+    assert "set_replacement" in prompt and "summer_sale.png, coffee.jpg" in prompt
+    assert 'set_replacement(label, "summer_sale.png")' in prompt  # the default when none is named
+    assert prompt.rstrip().endswith("no markdown.")
+
+
+def test_agent_offers_the_handlers_ad_images() -> None:
+    policy = Policy()
+    agent = VoiceAgent(ToolHandlers(policy, lambda: scenes.EMPTY, ad_assets=("coffee.jpg",)), lambda r, t: None,
+                       use_audio=False, think_model="gpt-4.1-mini")
+    think = agent._settings["agent"]["think"]
+    assert "coffee.jpg" in think["prompt"] and think["provider"]["model"] == "gpt-4.1-mini"
+    agent._loop.close()
 
 
 # --- VoiceAgent without network, key or audio ---
