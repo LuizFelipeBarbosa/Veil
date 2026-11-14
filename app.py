@@ -17,9 +17,10 @@ from pathlib import Path
 import capture
 import config
 import ui
-from contracts import Policy
+from contracts import AD_CLASSES, Policy
 from pipeline import Pipeline
 from recorder import Recorder
+from vision.replace import list_assets
 from voice.dg_agent import VoiceAgent
 from voice.tools import ToolHandlers
 
@@ -45,7 +46,21 @@ def main() -> None:
         log.info("%s: %s", role, text)
         transcript.append(f"{role}: {text}")
 
-    voice = VoiceAgent(ToolHandlers(policy, pipeline.scene), on_transcript, use_audio=not args.no_audio)
+    ad_assets = list_assets()
+    voice = VoiceAgent(
+        ToolHandlers(policy, pipeline.scene, ad_assets=ad_assets), on_transcript, use_audio=not args.no_audio
+    )
+
+    def cycle_ad() -> None:
+        """Key A: off -> first ad image -> next -> ... -> off, for every ad class at once."""
+        current = policy.snapshot().replacements.get(AD_CLASSES[0])
+        following = ad_assets[ad_assets.index(current) + 1 :] if current in ad_assets else ad_assets
+        for label in AD_CLASSES:
+            if following:
+                policy.set_replacement(label, following[0])
+            else:
+                policy.set_class_rule(label, "show")
+        log.info("ads: %s", following[0] if following else "not replaced")
 
     def toggle_recording() -> None:
         if recorder.is_recording:
@@ -89,6 +104,7 @@ def main() -> None:
                 on_panic=policy.set_panic,
                 on_enroll_owner=pipeline.enroll_owner,
                 on_point=pipeline.toggle_at,
+                on_cycle_ad=cycle_ad,
             ),
             max_frames=args.frames,
         )

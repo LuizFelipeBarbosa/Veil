@@ -12,11 +12,12 @@ import pytest
 
 import config
 import contracts
-from contracts import AD_CLASSES, KNOWN_CLASSES, Policy
+from contracts import AD_CLASSES, KNOWN_CLASSES, BufferedFrame, Policy, TrackedBox
 from fakes import scenes
 from fakes.capture import FileSource
 from pipeline import Pipeline, fail_closed_frame
 from recorder import Recorder
+from vision.replace import AdReplacer
 
 SYNTHETIC_CLIP = Path(__file__).parent / "data" / "synthetic.mp4"
 
@@ -232,3 +233,31 @@ def test_pipeline_fails_closed_without_detection(tmp_path: Path) -> None:
     assert ok
     # MJPG is lossy, so compare block means against the frame instead of exact flatness
     assert np.abs(first.astype(int) - fail_closed_frame(first, 0).image.astype(int)).mean() < 3
+
+
+def test_a_face_in_front_of_a_replaced_ad_is_still_pixelated(tmp_path: Path) -> None:
+    """Ads are drawn before censoring: the ad image covers the poster, the face box on top of it is pixelated."""
+    ad = np.random.default_rng(2).integers(0, 255, (90, 160, 3), dtype=np.uint8)
+    ad[..., :2] = 0  # a noisy, pure-red image: easy to tell from the frame, and not flat
+    cv2.imwrite(str(tmp_path / "ad.png"), ad)
+    policy = Policy()
+    policy.set_replacement("poster", "ad.png")
+    pipeline = Pipeline(FileSource(SYNTHETIC_CLIP), policy)
+    pipeline._ads = AdReplacer(tmp_path)
+    pipeline._watchdog.beat_faces(time.monotonic())
+    pipeline._watchdog.beat_objects(time.monotonic())
+
+    raw = np.random.default_rng(1).integers(0, 255, (config.FRAME_HEIGHT, config.FRAME_WIDTH, 3), dtype=np.uint8)
+    poster = TrackedBox("obj#1", "poster", (96, 96, 416, 336), 0.8, frame_index=0, last_seen=0.0)
+    face = TrackedBox("face#1", "face", (208, 160, 272, 224), 0.9, frame_index=0, last_seen=0.0)
+    frame = BufferedFrame(index=0, timestamp=0.0, image=raw, boxes=[poster, face], faces_done=True)
+
+    censored = pipeline._censor(frame)
+
+    assert not censored.fail_closed
+    ad_block = censored.image[104:120, 104:120]  # on the poster, away from the face
+    assert (ad_block[..., :2] == 0).all() and ad_block[..., 2].max() > ad_block[..., 2].min()  # the ad, unpixelated
+    face_block = censored.image[176:192, 224:240]
+    assert (face_block == face_block[0, 0]).all()  # one flat block: pixelated on top of the ad
+    assert (censored.image[:90] == raw[:90]).all()  # outside both boxes nothing changed
+    assert {h.id: h.state for h in censored.highlights} == {"obj#1": "replace", "face#1": "blur"}

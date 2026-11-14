@@ -21,7 +21,8 @@ import numpy as np
 import config
 from capture import CaptureThread, FrameSource, RingBuffer
 from contracts import (
-    EMPTY_SCENE, FACE, Action, BufferedFrame, CensoredFrame, Highlight, Policy, PolicySnapshot, Scene, TrackedBox,
+    EMPTY_SCENE, FACE, REPLACE, Action, BufferedFrame, CensoredFrame, Highlight, Policy, PolicySnapshot, Scene,
+    TrackedBox,
 )
 from recorder import Recorder
 from vision import policy as policy_rules
@@ -29,6 +30,7 @@ from vision import render
 from vision.faces import FaceDetector
 from vision.identity import OwnerIdentity
 from vision.objects import ObjectDetector, ObjectsThread
+from vision.replace import AdReplacer
 from vision.tracking import make_face_tracker, make_object_tracker
 
 log = logging.getLogger(__name__)
@@ -69,6 +71,7 @@ class Pipeline(threading.Thread):
         self._objects = ObjectsThread(ObjectDetector(), self._ring.newest)
         self._object_tracker = make_object_tracker()
         self._object_hold_over = render.HoldOver()
+        self._ads = AdReplacer()
         self._last_object_result_index = -1
         self._seen_track_ids: set[str] = set()
         self._confirmed_face_ids: set[str] = set()
@@ -254,11 +257,26 @@ class Pipeline(threading.Thread):
         log.info("owner enrolled from %s", largest.id)
 
     def _censor(self, frame: BufferedFrame) -> CensoredFrame:
+        """Ads are drawn first, so a face in front of a replaced ad is pixelated on top of it."""
         policy = self._policy.snapshot()
-        censored = render.censor(frame, policy, self._decide, self._watchdog.tripped(time.monotonic()))
+        now = time.monotonic()
+        with_ads = self._with_ads(frame, policy, now)
+        censored = render.censor(with_ads, policy, self._decide_censoring, self._watchdog.tripped(now))
         if censored.fail_closed:
             return censored
         return dataclasses.replace(censored, highlights=self._highlights(frame, policy))
+
+    def _with_ads(self, frame: BufferedFrame, policy: PolicySnapshot, now: float) -> BufferedFrame:
+        """The frame with an ad image over every box decided "replace". Still raw: it goes on to censor()."""
+        replaced = [box for box in frame.boxes if self._decide(box, policy) == REPLACE]
+        if not replaced or not frame.faces_done:
+            return frame
+        return dataclasses.replace(frame, image=self._ads.draw(frame.image, replaced, policy.replacements, now))
+
+    def _decide_censoring(self, box: TrackedBox, policy: PolicySnapshot) -> Action:
+        """What censor() needs to know: a replaced ad is already drawn over, so it is not pixelated."""
+        action = self._decide(box, policy)
+        return "show" if action == REPLACE else action
 
     def _highlights(self, frame: BufferedFrame, policy: PolicySnapshot) -> tuple[Highlight, ...]:
         """What the operator can point at: objects and confident faces, one entry per track."""
