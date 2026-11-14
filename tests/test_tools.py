@@ -663,31 +663,90 @@ class _FakeInputStream:
         self.running = False
 
 
-def test_talk_gate_streams_only_while_held_then_force_end_turn(monkeypatch: pytest.MonkeyPatch) -> None:
+_FORCE_END_TURN = json.dumps({"type": "ForceEndTurn"})
+_HELD = b"\x01\x00" * 4
+_LATE = b"\x02\x00" * 4
+
+
+@pytest.fixture
+def mic_agent(monkeypatch: pytest.MonkeyPatch):
+    """A VoiceAgent with a fake mic and a ready session; the test runs its loop by hand."""
     import types
 
     monkeypatch.setitem(sys.modules, "sounddevice", types.SimpleNamespace(RawInputStream=_FakeInputStream))
     _FakeInputStream.opened.clear()
     handlers, _ = _handlers()
     agent = VoiceAgent(handlers, lambda role, text: None, use_audio=True)
-    agent._speaker = None  # no playback thread work in this test
+    agent._speaker = None  # no playback thread work in these tests
     agent._ready.set()
-    run_loop = lambda: agent._loop.run_until_complete(asyncio.sleep(0))  # noqa: E731
+    yield agent
+    agent._loop.close()
 
-    agent._set_talking(True)
-    (mic,) = _FakeInputStream.opened
-    assert mic.running
-    mic.callback(b"\x01\x00" * 4, 4, None, None)
-    agent._set_talking(False)  # closes the mic; the audio scheduled above still goes first
-    mic.callback(b"\x02\x00" * 4, 4, None, None)  # a late callback after release is dropped
-    run_loop()
 
+def _run_loop(agent: VoiceAgent) -> None:
+    agent._loop.run_until_complete(asyncio.sleep(0))
+
+
+def _queued(agent: VoiceAgent) -> list:
     queued = []
     while not agent._outbox.empty():
         queued.append(agent._outbox.get_nowait())
-    assert not mic.running and agent._mic is None
-    assert queued == [b"\x01\x00" * 4, json.dumps({"type": "ForceEndTurn"})]
-    agent._loop.close()
+    return queued
+
+
+def test_talk_gate_streams_only_while_held_then_force_end_turn(mic_agent: VoiceAgent) -> None:
+    mic_agent.set_talking(True)
+    _run_loop(mic_agent)
+    (mic,) = _FakeInputStream.opened
+    assert mic.running
+    mic.callback(_HELD, 4, None, None)
+    mic_agent.set_talking(False)
+    _run_loop(mic_agent)
+    mic.callback(_LATE, 4, None, None)  # a callback after the loop closed the mic is dropped too
+    _run_loop(mic_agent)
+
+    assert not mic.running and mic_agent._mic is None
+    assert _queued(mic_agent) == [_HELD, _FORCE_END_TURN]
+
+
+def test_a_block_after_release_returns_is_dropped_before_the_loop_runs(mic_agent: VoiceAgent) -> None:
+    mic_agent.set_talking(True)
+    _run_loop(mic_agent)
+    (mic,) = _FakeInputStream.opened
+    mic.callback(_HELD, 4, None, None)
+    mic_agent.set_talking(False)
+    mic.callback(_LATE, 4, None, None)  # the loop has not run since release: the mic is still open
+    assert mic.running
+
+    _run_loop(mic_agent)
+    assert _queued(mic_agent) == [_HELD, _FORCE_END_TURN]  # held audio kept, ahead of ForceEndTurn
+
+
+def test_a_press_released_before_the_loop_runs_sends_no_audio(mic_agent: VoiceAgent) -> None:
+    mic_agent.set_talking(True)
+    mic_agent.set_talking(False)
+    _run_loop(mic_agent)  # the loop opens the mic for the press, then closes it for the release
+    (mic,) = _FakeInputStream.opened
+    mic.callback(_LATE, 4, None, None)
+    _run_loop(mic_agent)
+    assert not mic.running
+    assert _queued(mic_agent) == [_FORCE_END_TURN]
+
+
+def test_press_release_press_streams_again(mic_agent: VoiceAgent) -> None:
+    mic_agent.set_talking(True)
+    _run_loop(mic_agent)
+    first = _FakeInputStream.opened[0]
+    first.callback(_HELD, 4, None, None)
+    mic_agent.set_talking(False)
+    mic_agent.set_talking(True)  # pressed again before the loop ran
+    _run_loop(mic_agent)
+    second = _FakeInputStream.opened[-1]
+    assert second is not first and second.running and not first.running
+    held_again = b"\x03\x00" * 4
+    second.callback(held_again, 4, None, None)
+    _run_loop(mic_agent)
+    assert _queued(mic_agent) == [_HELD, _FORCE_END_TURN, held_again]
 
 
 def test_an_agent_error_message_ends_the_session_without_touching_policy() -> None:

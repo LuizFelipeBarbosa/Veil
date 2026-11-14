@@ -209,7 +209,13 @@ class VoiceAgent(threading.Thread):
         self._outbox: asyncio.Queue[str | bytes] = asyncio.Queue()
         self._stopping = asyncio.Event()
         self._ready = threading.Event()  # set while a session is up (after SettingsApplied)
-        self._talking = False
+        self._talking = False  # the loop's view: mic open, turn in progress
+        # The caller's view, set synchronously by set_talking. The audio callback sends a block
+        # only while this is True, so nothing captured after release returns can go out.
+        # The lock keeps "check and schedule the block" atomic with "release and schedule
+        # ForceEndTurn", so every accepted block reaches the outbox before ForceEndTurn.
+        self._talk_held = False
+        self._talk_lock = threading.Lock()
         self._mic: Any = None  # sounddevice.RawInputStream while Talk is held
         self._turn: _Turn | None = None
         self._speaker = _Speaker() if use_audio else None
@@ -217,8 +223,15 @@ class VoiceAgent(threading.Thread):
     # --- public, safe from any thread -----------------------------------------
 
     def set_talking(self, pressed: bool) -> None:
-        """Press opens the mic gate; release closes it and sends ForceEndTurn. Safe from any thread."""
-        self._call_on_loop(self._set_talking, bool(pressed))
+        """Press opens the mic gate; release closes it and sends ForceEndTurn. Safe from any thread.
+
+        The gate closes before this returns, without waiting for the loop: a mic block that
+        arrives after release is dropped. Blocks captured while held still go out, ahead of
+        ForceEndTurn, so the end of the utterance is not cut.
+        """
+        with self._talk_lock:
+            self._talk_held = bool(pressed)
+            self._call_on_loop(self._set_talking, bool(pressed))
 
     def inject_text(self, text: str) -> None:
         """Send a typed command as InjectUserMessage (tests and the no-mic path)."""
@@ -400,9 +413,9 @@ class VoiceAgent(threading.Thread):
             return
         self._talking = False
         self._close_mic()
-        # call_soon queues behind the mic callbacks already scheduled, so the last audio
-        # still goes out before ForceEndTurn.
-        self._loop.call_soon(self._end_turn)
+        # Every block the gate accepted was scheduled before this call (see set_talking),
+        # so the last audio is already in the outbox, ahead of ForceEndTurn.
+        self._end_turn()
 
     def _end_turn(self) -> None:
         self._outbox.put_nowait(json.dumps({"type": "ForceEndTurn"}))
@@ -423,8 +436,9 @@ class VoiceAgent(threading.Thread):
         import sounddevice  # only here: no audio device is needed for the text path
 
         def on_audio(data: Any, frames: int, time_info: Any, status: Any) -> None:
-            if self._talking:  # the gate, checked again on PortAudio's thread
-                self._call_on_loop(self._outbox.put_nowait, bytes(data))
+            with self._talk_lock:  # the gate, on PortAudio's thread; see set_talking
+                if self._talk_held:
+                    self._call_on_loop(self._outbox.put_nowait, bytes(data))
 
         self._mic = sounddevice.RawInputStream(
             samplerate=config.MIC_SAMPLE_RATE, channels=1, dtype="int16", blocksize=_MIC_BLOCK, callback=on_audio
