@@ -10,3 +10,4 @@ weights/
 .claude/worktrees/
 tests/data/*.mov
 tests/data/*.MOV
+tests/data/ad.mp4
