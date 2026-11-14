@@ -11,6 +11,7 @@ import argparse
 import logging
 import os
 import threading
+import time
 from collections import deque
 from pathlib import Path
 
@@ -40,11 +41,20 @@ def main() -> None:
     pipeline = Pipeline(capture.open_source(args.source), policy, recorder)
 
     transcript: deque[str] = deque(maxlen=config.TRANSCRIPT_LINES)
+    last_line_at = [float("-inf")]  # time.monotonic() of the newest transcript line
     talk_held = threading.Event()
 
     def on_transcript(role: str, text: str) -> None:
         log.info("%s: %s", role, text)
         transcript.append(f"{role}: {text}")
+        last_line_at[0] = time.monotonic()
+
+    def transcript_opacity() -> float:
+        """1 while Talk is held and for a while after the last line, then down to 0."""
+        if talk_held.is_set():
+            return 1.0
+        fading_for = time.monotonic() - last_line_at[0] - config.TRANSCRIPT_VISIBLE_S
+        return min(1.0, max(0.0, 1.0 - fading_for / config.TRANSCRIPT_FADE_S))
 
     ad_assets = list_assets()
     voice = VoiceAgent(
@@ -80,13 +90,15 @@ def main() -> None:
             # Fail closed: a frozen preview looks live. Exit so the service manager reopens the camera.
             raise CameraLost("the camera stopped delivering frames")
         latest = pipeline.latest()
+        opacity = transcript_opacity()
         return ui.UiStatus(
             recording=recorder.is_recording,
             recording_s=recorder.elapsed_s,
             fail_closed=latest is None or latest.fail_closed,
             panic=policy.snapshot().panic,
             talking=talk_held.is_set(),
-            transcript=tuple(transcript),
+            transcript=tuple(transcript) if opacity > 0 else (),  # gone: the pointing hint comes back
+            transcript_opacity=opacity,
             owner_enrolled=pipeline.owner_enrolled,
         )
 

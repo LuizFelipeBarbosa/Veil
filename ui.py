@@ -88,6 +88,7 @@ class UiStatus:
     panic: bool = False
     talking: bool = False
     transcript: tuple[str, ...] = ()  # newest last, "you: ..." / "agent: ..."
+    transcript_opacity: float = 1.0  # 1 fully visible, towards 0 as the chat fades out
     owner_enrolled: bool = False
 
 
@@ -401,7 +402,7 @@ def _draw(
     if status.panic:
         _draw_panic_banner(screen, layout)
     if status.transcript or not highlights:
-        _draw_transcript(screen, layout, status.transcript)
+        _draw_transcript(screen, layout, status.transcript, status.transcript_opacity)
     else:
         _draw_point_hint(screen, layout)
     _draw_record_button(screen, layout, status, controls)
@@ -480,20 +481,29 @@ def _draw_panic_banner(screen: pygame.Surface, layout: _Layout) -> None:
     _blit_centered(screen, _fit(font, "PANIC — everything blurred", banner.width - layout.gap * 2), banner.center)
 
 
-def _draw_transcript(screen: pygame.Surface, layout: _Layout, transcript: tuple[str, ...]) -> None:
-    """The last few lines, newest last, ellipsised to the preview width, over a translucent strip."""
+def _draw_transcript(
+    screen: pygame.Surface, layout: _Layout, transcript: tuple[str, ...], opacity: float = 1.0
+) -> None:
+    """The last few lines, newest last, ellipsised to the preview width, over a translucent strip.
+
+    `opacity` fades the strip and its text together.
+    """
     lines = transcript[-config.TRANSCRIPT_LINES:]
-    if not lines:
+    if not lines or opacity <= 0:
         return
     area = layout.preview_area
     font = layout.text_font
     line_height = font.get_linesize()
     strip = pygame.Rect(area.x, 0, area.width, line_height * len(lines) + layout.gap * 2)
     strip.bottom = area.bottom
-    _fill_translucent(screen, strip, _STRIP_RGBA)
+
+    chat = pygame.Surface(strip.size, pygame.SRCALPHA)
+    chat.fill(_STRIP_RGBA)
     max_width = strip.width - layout.gap * 2
     for i, line in enumerate(lines):
-        screen.blit(_fit(font, line, max_width), (strip.x + layout.gap, strip.y + layout.gap + i * line_height))
+        chat.blit(_fit(font, line, max_width), (layout.gap, layout.gap + i * line_height))
+    chat.set_alpha(round(255 * min(1.0, opacity)))
+    screen.blit(chat, strip.topleft)
 
 
 def _draw_point_hint(screen: pygame.Surface, layout: _Layout) -> None:

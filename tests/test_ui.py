@@ -657,3 +657,18 @@ def test_write_screenshots() -> None:
             screen = pygame.Surface(size)
             ui._draw(screen, layout, frame, status, controls, now=config.PANIC_HOLD_S * 0.4)
             pygame.image.save(screen, str(out / f"ui_{name}_{size[0]}x{size[1]}.png"))
+
+
+def test_the_chat_fades_with_its_opacity() -> None:
+    """Half opacity leaves the strip between the bare background and the fully drawn chat; zero draws nothing."""
+    pygame.init()
+    layout = ui._make_layout((480, 320))
+
+    def strip_brightness(opacity: float) -> int:
+        screen = pygame.Surface((480, 320))
+        screen.fill((0, 0, 0))
+        ui._draw_transcript(screen, layout, ("agent: " + "W" * 80,), opacity)
+        return int(pygame.surfarray.array3d(screen).sum())
+
+    assert strip_brightness(0.0) == 0
+    assert 0 < strip_brightness(0.5) < strip_brightness(1.0)

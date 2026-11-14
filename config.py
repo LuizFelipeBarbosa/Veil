@@ -26,13 +26,13 @@ YOLOE_NCNN_MODEL = WEIGHTS_DIR / "yoloe-26n-seg_ncnn_model"
 CAMERA_INDEX = 0  # Mac: built-in camera. Pi: the USB webcam.
 FRAME_WIDTH = 640
 FRAME_HEIGHT = 480
-# Measured on a Pi 4: next to YOLOE, one frame's face detection (upright + 2 rotated YuNet passes)
-# takes about 160 ms and an SFace check 270-550 ms more. At 4 FPS or faster the vision loop falls
-# behind and frames leave the buffer undetected, so they fail closed. 3 FPS keeps up.
-FPS = 3 if _ON_PI else 15
+# The camera rate on both profiles. A Pi 4 sustains about 12-13 FPS of face work on the live
+# camera (YOLOE paced by OBJECT_MIN_PERIOD_S, one rotated YuNet pass a frame); the pipeline skips
+# the frames it cannot reach, unseen, so the Pi's preview runs at whatever the scene allows.
+FPS = 15
 # Brief: 1 s. The lead chose a short delay at 13:25: about a third of a second, so a face swap on a
 # shown track can be visible for roughly 0.2 s before the identity check re-blurs it.
-DELAY_BUFFER_FRAMES = max(2, round(FPS / 3))  # Mac: 5 frames (0.33 s). Pi at 3 FPS: 2 frames (0.67 s)
+DELAY_BUFFER_FRAMES = max(2, round(FPS / 3))  # 5 frames (0.33 s)
 BACKFILL_FRAMES = DELAY_BUFFER_FRAMES - 1  # frames before a new face that get blurred too
 
 # True when the camera points at the operator (laptop camera): the operator's
@@ -41,6 +41,10 @@ CAMERA_FACES_OPERATOR = not _ON_PI
 
 # --- faces (YuNet) and owner (SFace) ---
 YUNET_INPUT_SIZE = (320, 240) if _ON_PI else (640, 480)  # (width, height)
+# Rotated YuNet passes per frame besides the upright one, round-robin over 5 angles. All 5 angles
+# must come round within HOLD_OVER_S or a tilted face unblurs between sightings: the Mac takes
+# 2.5 frames (0.17 s), the Pi 5 detected frames (0.4 s at 12.5 FPS).
+FACE_ROTATIONS_PER_CALL = 1 if _ON_PI else 2
 FACE_SCORE = 0.4  # Brief: 0.6. Real faces scored 0.3-0.6 in the leak test and went unblurred
 # A face track is blurred only once it has scored this at least once. Equal to FACE_SCORE: gate off.
 # 0.5 stops a static false hit (a wall pattern) from blurring, but let 2 confident faces through on crossing.mov.
@@ -63,12 +67,12 @@ BOX_PADDING = 0.25  # per side. Brief: 0.20. 0.35 was too much on the live previ
 HOLD_OVER_S = 0.5  # a lost track stays blurred this long
 PIXEL_BLOCK = 16  # px
 # No finished face detection for this long: whole frame pixelates. Brief: 0.3 s. The Pi 4 value must
-# cover one frame period (333 ms) plus its slowest detection (about 700 ms with an SFace check).
-FACE_WATCHDOG_S = 1.0 if _ON_PI else 0.300
+# cover one frame period (67 ms) plus its slowest detection (about 350 ms with an SFace check).
+FACE_WATCHDOG_S = 0.6 if _ON_PI else 0.300
 OBJECT_WATCHDOG_S = 1.5
 # Shortest time from one YOLOE run's start to the next. On the Pi a back-to-back YOLOE slows
 # face detection from about 56 ms to 91 ms a frame; the Mac runs it on the GPU and needs no pause.
-OBJECT_MIN_PERIOD_S = 0.3 if _ON_PI else 0.0
+OBJECT_MIN_PERIOD_S = 0.5 if _ON_PI else 0.0
 
 # --- ad replacement ---
 ADS_DIR = Path(__file__).parent / "assets" / "ads"  # landscape images; the file name is the asset name
@@ -91,6 +95,8 @@ KEY_RECORD = "r"
 KEY_TALK = "t"
 KEY_PANIC = "p"
 TRANSCRIPT_LINES = 3
+TRANSCRIPT_VISIBLE_S = 6.0  # the chat stays this long after its last line (and while Talk is held)...
+TRANSCRIPT_FADE_S = 1.5  # ...then fades out over this long
 
 # --- voice (Deepgram Voice Agent) ---
 DEEPGRAM_API_KEY_ENV = "DEEPGRAM_API_KEY"
