@@ -261,3 +261,32 @@ def test_a_face_in_front_of_a_replaced_ad_is_still_pixelated(tmp_path: Path) -> 
     assert (face_block == face_block[0, 0]).all()  # one flat block: pixelated on top of the ad
     assert (censored.image[:90] == raw[:90]).all()  # outside both boxes nothing changed
     assert {h.id: h.state for h in censored.highlights} == {"obj#1": "replace", "face#1": "blur"}
+
+
+def test_a_sign_box_inside_a_replaced_ad_does_not_pixelate_it_but_faces_and_chosen_blurs_do(tmp_path: Path) -> None:
+    ad = np.random.default_rng(2).integers(0, 255, (90, 160, 3), dtype=np.uint8)
+    cv2.imwrite(str(tmp_path / "ad.png"), ad)
+    policy = Policy()
+    policy.set_replacement("poster", "ad.png")
+    pipeline = Pipeline(FileSource(SYNTHETIC_CLIP), policy)
+    pipeline._ads = AdReplacer(tmp_path)
+    pipeline._watchdog.beat_faces(time.monotonic())
+    pipeline._watchdog.beat_objects(time.monotonic())
+
+    raw = np.random.default_rng(1).integers(0, 255, (config.FRAME_HEIGHT, config.FRAME_WIDTH, 3), dtype=np.uint8)
+    poster = TrackedBox("obj#1", "poster", (96, 96, 416, 336), 0.8, frame_index=0, last_seen=0.0)
+    same_panel = TrackedBox("obj#2", "storefront sign", (112, 112, 400, 320), 0.5, frame_index=0, last_seen=0.0)
+    elsewhere = TrackedBox("obj#3", "street sign", (480, 368, 560, 432), 0.5, frame_index=0, last_seen=0.0)
+
+    def flat(image: np.ndarray, y: int, x: int) -> bool:
+        """Pixelated: a 16x16 patch spans at most 4 blocks, so at most 4 colours. The noise has hundreds."""
+        patch = image[y : y + 16, x : x + 16].reshape(-1, 3)
+        return len(np.unique(patch, axis=0)) <= 4
+
+    frame = BufferedFrame(index=0, timestamp=0.0, image=raw, boxes=[poster, same_panel, elsewhere], faces_done=True)
+    censored = pipeline._censor(frame)
+    assert not flat(censored.image, 200, 200)  # the ad, not pixelated by the sign box on the same panel
+    assert flat(censored.image, 392, 512)  # a sign outside the ad is still pixelated
+
+    policy.set_track_override("obj#2", "blur")  # the operator's own choice wins
+    assert flat(pipeline._censor(frame).image, 200, 200)

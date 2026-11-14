@@ -21,8 +21,8 @@ import numpy as np
 import config
 from capture import CaptureThread, FrameSource, RingBuffer
 from contracts import (
-    EMPTY_SCENE, FACE, REPLACE, Action, BufferedFrame, CensoredFrame, Highlight, Policy, PolicySnapshot, Scene,
-    TrackedBox,
+    CENSORED_OBJECT_CLASSES, EMPTY_SCENE, FACE, REPLACE, Action, BufferedFrame, CensoredFrame, Highlight, Policy,
+    PolicySnapshot, Scene, TrackedBox,
 )
 from recorder import Recorder
 from vision import policy as policy_rules
@@ -64,6 +64,7 @@ class _Throughput:
             self._since, self._frames, self._fail_closed, self._skipped = now, 0, 0, 0
 
 _FRAME_WAIT_S = 0.1
+_SIGN_INSIDE_AD_SHARE = 0.8  # of the sign box's area; see Pipeline._with_ads
 
 
 def fail_closed_frame(image: np.ndarray, index: int) -> CensoredFrame:
@@ -310,11 +311,25 @@ class Pipeline(threading.Thread):
         return dataclasses.replace(censored, highlights=self._highlights(frame, policy))
 
     def _with_ads(self, frame: BufferedFrame, policy: PolicySnapshot, now: float) -> BufferedFrame:
-        """The frame with an ad image over every box decided "replace". Still raw: it goes on to censor()."""
+        """The frame with an ad image over every box decided "replace". Still raw: it goes on to censor().
+
+        The model often boxes one ad panel twice, as an ad and as a sign. The lead chose (15:38) that
+        the ad wins: a sign box lying almost wholly inside a replaced ad is dropped, so the ad is not
+        pixelated. Faces are never dropped, and neither is a sign the operator chose to blur.
+        """
         replaced = [box for box in frame.boxes if self._decide(box, policy) == REPLACE]
         if not replaced or not frame.faces_done:
             return frame
-        return dataclasses.replace(frame, image=self._ads.draw(frame.image, replaced, policy.replacements, now))
+        kept = [
+            box for box in frame.boxes
+            if not (
+                box.label in CENSORED_OBJECT_CLASSES
+                and box.id not in policy.track_overrides
+                and any(_share_inside(box.xyxy, ad.xyxy) >= _SIGN_INSIDE_AD_SHARE for ad in replaced)
+            )
+        ]
+        image = self._ads.draw(frame.image, replaced, policy.replacements, now)
+        return dataclasses.replace(frame, image=image, boxes=kept)
 
     def _decide_censoring(self, box: TrackedBox, policy: PolicySnapshot) -> Action:
         """What censor() needs to know: a replaced ad is already drawn over, so it is not pixelated."""
@@ -339,6 +354,14 @@ class Pipeline(threading.Thread):
         if box.is_owner and box.frame_index <= self._owner_lost_at.get(box.id, -1):
             box = dataclasses.replace(box, is_owner=False)
         return policy_rules.decide(box, policy)
+
+
+def _share_inside(inner: tuple[int, int, int, int], outer: tuple[int, int, int, int]) -> float:
+    """The share of `inner`'s area that lies inside `outer`."""
+    width = min(inner[2], outer[2]) - max(inner[0], outer[0])
+    height = min(inner[3], outer[3]) - max(inner[1], outer[1])
+    area = (inner[2] - inner[0]) * (inner[3] - inner[1])
+    return max(0, width) * max(0, height) / area if area > 0 else 0.0
 
 
 def _without_weak_duplicates(boxes: list[TrackedBox]) -> list[TrackedBox]:
