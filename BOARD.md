@@ -23,6 +23,7 @@ Milestones: 13:00 faces blurred (Mac) | 14:00 owner + signs/plates | 14:45 voice
 | 20 | Live ad replacement, vision: ad prompts, corner fit and warp (vision/replace.py), NCNN re-export | merged 14:55; tested on synthetic posters only | 14:41–14:52 | wp20-ad-replace | lead: images in assets/ads/, try a real poster |
 | 21 | Live ad replacement, voice and UI: set_replacement tool handler, prompt, key A | merged 14:55; live check 46/48 | 14:41–14:54 | wp21-ad-voice-ui | no on-screen Ad button (Pi: voice only) |
 | 22 | Replaced ads too jittery: one drawing per sign, state by position, motion filter | merged; lead to re-watch | 15:07– | wp22-ad-smooth | lead: re-watch ad.mp4 |
+| 23 | Ads: stale ad after a scene cut, sliding, glass/occluders | merged 15:36; cut fixed, glass only partly (needs masks) | 15:23–15:31 | wp23-ad-cuts-occlusion | lead: re-watch; panel blurred as a sign after the cut |
 | 8 | Integration (orchestrator) | all threads wired 12:03; live voice test pending | 12:03– | main | lead: hold T and speak |
 | 9 | Pi port (orchestrator + lead) | queued | 14:45–15:30 | main | needs WP8, the Pi |
 | 10 | Leak review (read-only) | queued | 15:30–16:00 | — | needs WP9 |
