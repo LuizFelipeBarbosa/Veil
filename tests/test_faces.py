@@ -69,7 +69,9 @@ def test_faces_found_in_the_faces_clip_at_both_input_sizes() -> None:
             assert 0 <= x1 < x2 <= config.FRAME_WIDTH and 0 <= y1 < y2 <= config.FRAME_HEIGHT
             assert detection.label == FACE and detection.conf >= config.FACE_SCORE
             assert detection.face_row is not None and detection.face_row.shape == (15,)
-            # Landmarks (the eyes) sit inside the box, in frame pixels.
-            assert x1 <= detection.face_row[4] <= x2 and y1 <= detection.face_row[5] <= y2
+            # face_row is in frame pixels too: its box, clipped, is the detection's box.
+            x, y, w, h = detection.face_row[:4]
+            assert abs(max(x, 0) - x1) <= 1 and abs(min(x + w, config.FRAME_WIDTH) - x2) <= 1
+            assert abs(max(y, 0) - y1) <= 1 and abs(min(y + h, config.FRAME_HEIGHT) - y2) <= 1
     source.release()
     assert frames_with_faces > 0
