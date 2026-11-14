@@ -1,4 +1,4 @@
-"""WP1 + WP3: the touch UI. Headless pygame, no real screen; time comes from a fake clock."""
+"""WP1 + WP3 + WP13: the touch UI. Headless pygame, no real screen; time comes from a fake clock."""
 
 from __future__ import annotations
 
@@ -16,11 +16,18 @@ import pytest
 
 import config
 import ui
-from contracts import CensoredFrame
+from contracts import CensoredFrame, Highlight
 from ui import UiCallbacks, UiStatus
 
 SIZES = [(640, 480), (480, 320), (1280, 800), (800, 480), ui._default_window_size()]
+POINT_SIZES = [ui._default_window_size(), (480, 320), (1280, 800)]  # 856x480: the Mac window, no bars
 SCREENSHOT_DIR_ENV = "PRIVACY_CAM_UI_SCREENSHOTS"  # set to a directory to write the PNGs
+
+HIGHLIGHTS = (
+    Highlight(id="t1", label="face", xyxy=(80, 140, 200, 300), state="blur"),
+    Highlight(id="t2", label="face", xyxy=(300, 120, 420, 290), state="show", is_owner=True),
+    Highlight(id="t3", label="street sign", xyxy=(470, 220, 600, 300), state="blur"),
+)
 
 
 def _black_frame() -> CensoredFrame:
@@ -31,6 +38,11 @@ def _black_frame() -> CensoredFrame:
 def _button_rects(size: tuple[int, int]) -> dict[str, pygame.Rect]:
     pygame.font.init()
     return dict(ui._make_layout(size).buttons)
+
+
+def _frame_rect(size: tuple[int, int]) -> pygame.Rect:
+    pygame.font.init()
+    return ui._make_layout(size).frame_rect
 
 
 # --- event builders ---------------------------------------------------------
@@ -52,7 +64,11 @@ def _mouse_up(pos: tuple[int, int]) -> pygame.event.Event:
     return pygame.event.Event(pygame.MOUSEBUTTONUP, pos=pos, button=1, touch=False)
 
 
-def _finger(kind: int, pos: tuple[int, int], size: tuple[int, int], finger_id: int = 0) -> pygame.event.Event:
+def _mouse_move(pos: tuple[int, int]) -> pygame.event.Event:
+    return pygame.event.Event(pygame.MOUSEMOTION, pos=pos, rel=(0, 0), buttons=(1, 0, 0), touch=False)
+
+
+def _finger(kind: int, pos: tuple[float, float], size: tuple[int, int], finger_id: int = 0) -> pygame.event.Event:
     x, y = pos[0] / size[0], pos[1] / size[1]
     return pygame.event.Event(kind, x=x, y=y, dx=0.0, dy=0.0, touch_id=1, finger_id=finger_id, pressure=1.0)
 
@@ -61,6 +77,25 @@ def _press_release(kind: str, pos: tuple[int, int], size: tuple[int, int]) -> li
     if kind == "mouse":
         return [_mouse_down(pos), _mouse_up(pos)]
     return [_finger(pygame.FINGERDOWN, pos, size), _finger(pygame.FINGERUP, pos, size)]
+
+
+def _tap(kind: str, pixel: tuple[int, int], size: tuple[int, int]) -> list[pygame.event.Event]:
+    """A tap on one window pixel. A finger lands on the pixel's centre, as a real touch would."""
+    if kind == "mouse":
+        return _press_release(kind, pixel, size)
+    return _press_release(kind, (pixel[0] + 0.5, pixel[1] + 0.5), size)  # type: ignore[arg-type]
+
+
+def _drag(kind: str, start: tuple[int, int], end: tuple[int, int], size: tuple[int, int]) -> list[pygame.event.Event]:
+    """Press at start, move to end and back, release at start: still a drag, never a tap."""
+    if kind == "mouse":
+        return [_mouse_down(start), _mouse_move(end), _mouse_move(start), _mouse_up(start)]
+    return [
+        _finger(pygame.FINGERDOWN, start, size),
+        _finger(pygame.FINGERMOTION, end, size),
+        _finger(pygame.FINGERMOTION, start, size),
+        _finger(pygame.FINGERUP, start, size),
+    ]
 
 
 # --- a fake app around ui.run ------------------------------------------------
@@ -81,6 +116,7 @@ class _FakeApp:
             "on_talk": lambda pressed: self.calls.append(("talk", pressed)),
             "on_panic": self._set_panic,
             "on_enroll_owner": lambda: self.calls.append(("owner",)),
+            "on_point": lambda x, y: self.calls.append(("point", x, y)),
         }
         return UiCallbacks(**{**callbacks, **overrides})
 
@@ -217,10 +253,187 @@ def test_pointer_presses_every_button(kind: str, size: tuple[int, int]) -> None:
 
 
 @pytest.mark.parametrize("kind", ["mouse", "finger"])
-def test_press_on_preview_does_nothing(kind: str) -> None:
+def test_press_on_preview_presses_no_button(kind: str) -> None:
     app = _FakeApp()
     app.run({1: _press_release(kind, (50, 200), (640, 480))})
+    assert [call[0] for call in app.calls] == ["point"]
+
+
+# --- pointing at the preview (WP13) ---------------------------------------------------
+
+
+def _assert_points(calls: list[tuple], expected: list[tuple[int, int]]) -> None:
+    assert [call[0] for call in calls] == ["point"] * len(expected)
+    for (_, x, y), (want_x, want_y) in zip(calls, expected):
+        assert abs(x - want_x) <= 1 and abs(y - want_y) <= 1, ((x, y), (want_x, want_y))
+
+
+@pytest.mark.parametrize("kind", ["mouse", "finger"])
+@pytest.mark.parametrize("size", POINT_SIZES)
+def test_tap_maps_window_to_frame_pixels(kind: str, size: tuple[int, int]) -> None:
+    rect = _frame_rect(size)
+    last_x, last_y = config.FRAME_WIDTH - 1, config.FRAME_HEIGHT - 1
+    taps = [
+        (rect.center, (config.FRAME_WIDTH // 2, config.FRAME_HEIGHT // 2)),
+        (rect.topleft, (0, 0)),
+        ((rect.right - 1, rect.top), (last_x, 0)),
+        ((rect.left, rect.bottom - 1), (0, last_y)),
+        ((rect.right - 1, rect.bottom - 1), (last_x, last_y)),
+    ]
+    app = _FakeApp()
+    app.run({i + 1: _tap(kind, pixel, size) for i, (pixel, _) in enumerate(taps)}, size=size)
+    _assert_points(app.calls, [frame_pixel for _, frame_pixel in taps])
+
+
+def test_mac_window_maps_one_to_one() -> None:
+    pygame.font.init()
+    layout = ui._make_layout(ui._default_window_size())
+    assert layout.frame_rect == pygame.Rect(0, 0, config.FRAME_WIDTH, config.FRAME_HEIGHT)
+    assert layout.frame_point((123, 345)) == (123, 345)
+
+
+@pytest.mark.parametrize("kind", ["mouse", "finger"])
+@pytest.mark.parametrize("size", [(480, 320), (1280, 800)])
+def test_tap_in_the_letterbox_bars_points_at_nothing(kind: str, size: tuple[int, int]) -> None:
+    rect = _frame_rect(size)
+    assert rect.top > 0  # these sizes do have bars
+    app = _FakeApp()
+    app.run({
+        1: _tap(kind, (rect.centerx, rect.top - 3), size),
+        2: _tap(kind, (rect.centerx, rect.bottom + 2), size),
+        3: _tap(kind, (rect.left, 0), size),
+    }, size=size)
     assert app.calls == []
+
+
+@pytest.mark.parametrize("kind", ["mouse", "finger"])
+@pytest.mark.parametrize("size", POINT_SIZES)
+def test_tap_on_a_button_does_not_point(kind: str, size: tuple[int, int]) -> None:
+    app = _FakeApp()
+    app.run({1: _tap(kind, _button_rects(size)["owner"].center, size)}, size=size)
+    assert app.calls == [("owner",)]
+
+
+@pytest.mark.parametrize("kind", ["mouse", "finger"])
+@pytest.mark.parametrize("size", POINT_SIZES)
+def test_drag_on_the_preview_does_not_point(kind: str, size: tuple[int, int]) -> None:
+    rect = _frame_rect(size)
+    far = (rect.centerx + rect.width // 5, rect.centery)
+    app = _FakeApp()
+    app.run({1: _drag(kind, rect.center, far, size)}, size=size)
+    assert app.calls == []
+
+
+@pytest.mark.parametrize("kind", ["mouse", "finger"])
+def test_small_wobble_is_still_a_tap(kind: str) -> None:
+    size = (480, 320)
+    rect = _frame_rect(size)
+    nudge = (rect.centerx + 3, rect.centery + 2)
+    app = _FakeApp()
+    if kind == "mouse":
+        events = [_mouse_down(rect.center), _mouse_move(nudge), _mouse_up(nudge)]
+    else:
+        events = [_finger(pygame.FINGERDOWN, rect.center, size), _finger(pygame.FINGERMOTION, nudge, size),
+                  _finger(pygame.FINGERUP, nudge, size)]
+    app.run({1: events}, size=size)
+    assert [call[0] for call in app.calls] == ["point"]
+
+
+@pytest.mark.parametrize("kind", ["mouse", "finger"])
+def test_talk_press_released_over_the_preview_closes_and_does_not_point(kind: str) -> None:
+    size = (480, 320)
+    talk, centre = _button_rects(size)["talk"].center, _frame_rect(size).center
+    if kind == "mouse":
+        script = {1: [_mouse_down(talk)], 2: [_mouse_move(centre)], 3: [_mouse_up(centre)]}
+    else:
+        script = {1: [_finger(pygame.FINGERDOWN, talk, size)], 2: [_finger(pygame.FINGERMOTION, centre, size)],
+                  3: [_finger(pygame.FINGERUP, centre, size)]}
+    app = _FakeApp()
+    app.run(script, size=size)
+    assert app.calls == [("talk", True), ("talk", False)]
+
+
+def test_mouse_events_synthesised_from_a_touch_do_not_point_twice() -> None:
+    size = (480, 320)
+    centre = _frame_rect(size).center
+    synthetic = [pygame.event.Event(kind, pos=centre, button=1, touch=True)
+                 for kind in (pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP)]
+    app = _FakeApp()
+    app.run({1: [_finger(pygame.FINGERDOWN, centre, size), synthetic[0],
+                 _finger(pygame.FINGERUP, centre, size), synthetic[1]]}, size=size)
+    assert [call[0] for call in app.calls] == ["point"]
+
+
+def test_a_raising_on_point_does_not_stop_the_loop() -> None:
+    def boom(x: int, y: int) -> None:
+        raise RuntimeError("toggle failed")
+
+    centre = _frame_rect((640, 480)).center
+    app = _FakeApp()
+    app.run({1: _tap("mouse", centre, (640, 480)), 2: [_key_down(pygame.K_e)], 3: _tap("finger", centre, (640, 480))},
+            frames=6, on_point=boom)
+    assert app.ticks == 6
+    assert app.calls == [("owner",)]
+
+
+# --- highlights on the preview (WP13) --------------------------------------------------
+
+
+def _render(size: tuple[int, int], frame: CensoredFrame, status: UiStatus = UiStatus()) -> pygame.Surface:
+    pygame.font.init()
+    screen = pygame.Surface(size)
+    ui._draw(screen, ui._make_layout(size), frame, status, ui._Controls(UiCallbacks()), now=0.0)
+    return screen
+
+
+def _with_highlights(frame: CensoredFrame, highlights: tuple[Highlight, ...] = HIGHLIGHTS) -> CensoredFrame:
+    return CensoredFrame(image=frame.image, index=frame.index, fail_closed=frame.fail_closed, highlights=highlights)
+
+
+@pytest.mark.parametrize("size", POINT_SIZES)
+def test_highlights_are_outlined_at_their_scaled_position(size: tuple[int, int]) -> None:
+    plain = _pixelated_frame()
+    with_boxes = _render(size, _with_highlights(plain))
+    without = _render(size, plain)
+    layout = ui._make_layout(size)
+    for highlight in HIGHLIGHTS:
+        box = layout.window_rect(highlight.xyxy)
+        colour = ui._HIGHLIGHT_SHOWN if highlight.state == "show" else ui._HIGHLIGHT_BLURRED
+        for edge in [(box.left, box.centery), (box.right - 1, box.centery), (box.centerx, box.bottom - 1)]:
+            assert tuple(with_boxes.get_at(edge))[:3] == colour
+            assert with_boxes.get_at(edge) != without.get_at(edge)
+        inside = (box.centerx, box.centery + box.height // 4)
+        assert with_boxes.get_at(inside) == without.get_at(inside)  # outline only, no fill
+
+
+def test_blurred_and_shown_outlines_differ() -> None:
+    assert ui._HIGHLIGHT_BLURRED != ui._HIGHLIGHT_SHOWN
+
+
+def test_fail_closed_frames_show_no_highlights() -> None:
+    size = (480, 320)
+    blacked_out = _black_frame()
+    assert pygame.image.tobytes(_render(size, _with_highlights(blacked_out)), "RGB") == \
+        pygame.image.tobytes(_render(size, blacked_out), "RGB")
+
+
+def test_hint_shows_only_until_there_is_a_transcript() -> None:
+    size = (480, 320)
+    layout = ui._make_layout(size)
+    probe = (layout.preview_area.x + layout.gap + 1, layout.preview_area.bottom - 2)
+    frame = _with_highlights(_pixelated_frame())
+    plain = _render(size, _pixelated_frame())
+    assert _render(size, frame).get_at(probe) != plain.get_at(probe)  # hint strip
+    talking = UiStatus(transcript=("agent: hi",))
+    assert _render(size, frame, talking).get_at(probe) == _render(size, _pixelated_frame(), talking).get_at(probe)
+
+
+def test_drawing_highlights_never_touches_the_frame_image() -> None:
+    frame = _with_highlights(_pixelated_frame())
+    before = frame.image.tobytes()
+    ui.run(lambda: frame, max_frames=3, window_size=(480, 320))
+    _render((1280, 800), frame)
+    assert frame.image.tobytes() == before
 
 
 # --- Talk: the mic never stays open ---------------------------------------------
@@ -358,9 +571,15 @@ def test_draw_handles_every_state_at_every_size() -> None:
     pygame.font.init()
     status = UiStatus(recording=True, recording_s=5, fail_closed=True, panic=True, talking=True,
                       transcript=tuple(f"you: line {i} " * 20 for i in range(6)), owner_enrolled=True)
+    edge_cases = HIGHLIGHTS + (
+        Highlight(id="edge", label="a very long label for a tiny box", xyxy=(0, 0, 3, 3), state="show"),
+        Highlight(id="corner", label="face", xyxy=(600, 440, 640, 480), state="blur", is_owner=True),
+    )
     for size in SIZES:
-        screen = pygame.Surface(size)
-        ui._draw(screen, ui._make_layout(size), _pixelated_frame(), status, ui._Controls(UiCallbacks()), now=0.0)
+        for frame in (_pixelated_frame(), _with_highlights(_pixelated_frame(), edge_cases)):
+            for shown in (status, UiStatus()):
+                screen = pygame.Surface(size)
+                ui._draw(screen, ui._make_layout(size), frame, shown, ui._Controls(UiCallbacks()), now=0.0)
 
 
 # --- screenshots, only when asked ---------------------------------------------------
@@ -381,8 +600,6 @@ def test_write_screenshots() -> None:
     out = Path(os.environ[SCREENSHOT_DIR_ENV])
     out.mkdir(parents=True, exist_ok=True)
     pygame.font.init()
-    size = (800, 480)
-    layout = ui._make_layout(size)
     transcript = (
         "you: blur the license plate on the left",
         "agent: Done, plate blurred.",
@@ -390,15 +607,20 @@ def test_write_screenshots() -> None:
     )
     panic_controls = ui._Controls(UiCallbacks())
     panic_controls.press("mouse", "panic", UiStatus(panic=True), now=0.0)
+    live = _with_highlights(_pixelated_frame())  # one blurred face, the owner's face shown, a blurred sign
+    blacked_out = CensoredFrame(image=live.image, index=0, fail_closed=True, highlights=HIGHLIGHTS)  # drawn without
     shots = {
-        "idle": (UiStatus(), ui._Controls(UiCallbacks())),
+        "idle": (live, UiStatus(), ui._Controls(UiCallbacks())),
         "recording_talking": (
+            live,
             UiStatus(recording=True, recording_s=83, talking=True, transcript=transcript, owner_enrolled=True),
             ui._Controls(UiCallbacks()),
         ),
-        "panic": (UiStatus(recording=True, recording_s=125, fail_closed=True, panic=True), panic_controls),
+        "panic": (blacked_out, UiStatus(recording=True, recording_s=125, fail_closed=True, panic=True), panic_controls),
     }
-    for name, (status, controls) in shots.items():
-        screen = pygame.Surface(size)
-        ui._draw(screen, layout, _pixelated_frame(), status, controls, now=config.PANIC_HOLD_S * 0.4)
-        pygame.image.save(screen, str(out / f"ui_{name}.png"))
+    for size in [(800, 480), (480, 320)]:
+        layout = ui._make_layout(size)
+        for name, (frame, status, controls) in shots.items():
+            screen = pygame.Surface(size)
+            ui._draw(screen, layout, frame, status, controls, now=config.PANIC_HOLD_S * 0.4)
+            pygame.image.save(screen, str(out / f"ui_{name}_{size[0]}x{size[1]}.png"))
