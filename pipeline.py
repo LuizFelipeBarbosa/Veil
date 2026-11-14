@@ -35,6 +35,34 @@ from vision.tracking import make_face_tracker, make_object_tracker
 
 log = logging.getLogger(__name__)
 
+_THROUGHPUT_LOG_S = 10.0
+
+
+class _Throughput:
+    """Logs how many frames were published, failed closed or were skipped unseen, every 10 s."""
+
+    def __init__(self) -> None:
+        self._since: float | None = None
+        self._frames = 0
+        self._fail_closed = 0
+        self._skipped = 0
+
+    def count_skipped(self) -> None:
+        self._skipped += 1
+
+    def count(self, fail_closed: bool, now: float) -> None:
+        if self._since is None:
+            self._since = now
+        self._frames += 1
+        self._fail_closed += fail_closed
+        elapsed = now - self._since
+        if elapsed >= _THROUGHPUT_LOG_S:
+            log.info(
+                "published %.1f FPS, %d of %d frames failed closed, %d skipped unseen",
+                self._frames / elapsed, self._fail_closed, self._frames, self._skipped,
+            )
+            self._since, self._frames, self._fail_closed, self._skipped = now, 0, 0, 0
+
 _FRAME_WAIT_S = 0.1
 
 
@@ -66,11 +94,14 @@ class Pipeline(threading.Thread):
         self._identity = OwnerIdentity()
         self._hold_over = render.HoldOver()
         self._watchdog = render.Watchdog()
+        self._throughput = _Throughput()
 
         # Built before any thread starts: loading YOLOE changes the working directory for a moment.
         self._objects = ObjectsThread(ObjectDetector(), self._ring.newest)
         self._object_tracker = make_object_tracker()
-        self._object_hold_over = render.HoldOver()
+        # YOLOE results arrive OBJECT_MIN_PERIOD_S apart at best, so an object must stay blurred that
+        # much longer than a face, or it would unblur between two detections.
+        self._object_hold_over = render.HoldOver(config.HOLD_OVER_S + config.OBJECT_MIN_PERIOD_S)
         self._ads = AdReplacer()
         self._last_object_result_index = -1
         self._seen_track_ids: set[str] = set()
@@ -124,24 +155,33 @@ class Pipeline(threading.Thread):
         self._capture.start()
         self._objects.start()
         last_index = -1
+        attempted: set[int] = set()  # buffered frames detection ran on, whether or not it succeeded
         while not self._stop_requested.is_set():
-            newest = self._capture.wait_for_frame(last_index, _FRAME_WAIT_S)
-            if newest is None:
+            if self._capture.wait_for_frame(last_index, _FRAME_WAIT_S) is None:
                 if not self._capture.is_alive():
                     break
                 continue
+            # When detection is slower than the camera, frames queue up. Detect the newest one and
+            # skip the rest: a skipped frame is never shown, so the preview slows down instead of
+            # showing frames that left the buffer undetected (those would fail closed).
+            newest = self._ring.newest()
             last_index = newest.index
+            attempted.add(newest.index)
             self._detect_or_leave_unchecked(newest)
 
-            oldest = self._ring.pop_oldest()
-            if oldest is not None:
-                self._publish(self._censor_or_fail_closed(oldest))
+            while (oldest := self._ring.pop_oldest()) is not None:
+                if oldest.index in attempted:
+                    self._publish(self._censor_or_fail_closed(oldest))
+                else:
+                    self._throughput.count_skipped()
+                attempted = {index for index in attempted if index > oldest.index}
         self._capture.stop()
         self._objects.stop()
 
     def _publish(self, censored: CensoredFrame) -> None:
         with self._latest_lock:
             self._latest = censored
+        self._throughput.count(censored.fail_closed, time.monotonic())
         if self._recorder is not None:
             self._recorder.write(censored)
 

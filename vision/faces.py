@@ -25,8 +25,6 @@ _SCORE_COLUMN = 14
 # Extra passes, degrees counter-clockwise, besides upright: YuNet holds about +-30, so 60-degree steps.
 # Ordered so consecutive calls cover far-apart angles.
 _ROTATIONS = (60, 180, 300, 120, 240)
-# Rotated passes per detect() call, round-robin; upright runs every call. None runs them all.
-_ROTATIONS_PER_CALL = 2
 _NOSE_COLUMNS = [8, 9]  # the third landmark; two passes' hits are one face when their noses agree
 # Or when the stronger hit's box already covers this share of the weaker one's box.
 _COVERED_SHARE = 0.7
@@ -45,7 +43,7 @@ class FaceDetector:
         input_size: tuple[int, int] = config.YUNET_INPUT_SIZE,
         score: float = config.FACE_SCORE,
         rotations: tuple[int, ...] = _ROTATIONS,
-        rotations_per_call: int | None = _ROTATIONS_PER_CALL,
+        rotations_per_call: int | None = config.FACE_ROTATIONS_PER_CALL,
     ) -> None:
         self._input_size = tuple(input_size)  # (width, height)
         self._rotations = tuple(rotations)
