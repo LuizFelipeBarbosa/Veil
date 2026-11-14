@@ -61,6 +61,9 @@ def main() -> None:
         voice.set_talking(pressed)
 
     def status() -> ui.UiStatus:
+        if args.source is None and not pipeline.is_alive():
+            # Fail closed: a frozen preview looks live. Exit so the service manager reopens the camera.
+            raise CameraLost("the camera stopped delivering frames")
         latest = pipeline.latest()
         return ui.UiStatus(
             recording=recorder.is_recording,
@@ -94,6 +97,10 @@ def main() -> None:
         pipeline.stop()
         pipeline.join(timeout=2.0)
         recorder.stop()
+
+
+class CameraLost(RuntimeError):
+    """The live camera went away (unplugged, USB reset) while the app was running."""
 
 
 def _load_env_file() -> None:

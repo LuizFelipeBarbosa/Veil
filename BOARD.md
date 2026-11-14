@@ -16,7 +16,7 @@ Milestones: 13:00 faces blurred (Mac) | 14:00 owner + signs/plates | 14:45 voice
 | 13 | Point at a track to blur/unblur; operator highlights | merged 12:31, wired to pipeline.toggle_at | 12:21–12:28 | wp13-point-ui | lead: try it live |
 | 14 | Voice: show_all ("unblur everything"), blur/unblur select things | merged 12:53 as PARTIAL: 40/42 live, 2 commands flaky | 12:21–12:52 | wp14-voice-show-all | 'blur her again', 'unblur the guy' sometimes wrong |
 | 15 | Remember unblurred people across track changes (session memory, by face) | merged 12:47 | 12:40–12:47 | wp15-remember-people | — |
-| 16 | Street signs: only street-name signs blur; stop, one-way and other traffic signs don't | running since 12:54 (30 min box) | 12:54–13:25 | wp16-street-name-signs | — |
+| 16 | Street signs: only street-name signs blur; stop, one-way and other traffic signs don't | merged 13:01; NCNN at 320 finds no signs on the clip | 12:54–13:00 | wp16-street-name-signs | lead: check intersection clip; Pi sign confidence |
 | 8 | Integration (orchestrator) | all threads wired 12:03; live voice test pending | 12:03– | main | lead: hold T and speak |
 | 9 | Pi port (orchestrator + lead) | queued | 14:45–15:30 | main | needs WP8, the Pi |
 | 10 | Leak review (read-only) | queued | 15:30–16:00 | — | needs WP9 |
