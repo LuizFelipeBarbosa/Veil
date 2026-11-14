@@ -16,7 +16,7 @@ import pytest
 
 import config
 from contracts import Policy, TrackedBox
-from vision.identity import OwnerIdentity, _RememberedPeople
+from vision.identity import _MIN_CHECK_PX, OwnerIdentity, _Reference, _RememberedPeople
 from vision.policy import decide
 
 OWNER, TWIN, STRANGER, OTHER, BROKEN = 0, 1, 2, 3, 4
@@ -44,8 +44,9 @@ class FakeEmbedder:
         return PEOPLE[person]
 
 
-def _row(person: int) -> np.ndarray:
-    return np.array([person] + [0] * 14, dtype=np.float32)
+def _row(person: int, face_px: float = 120) -> np.ndarray:
+    """The person in the first value; the YuNet box height (index 3) matters for enrolment."""
+    return np.array([person, 0, face_px, face_px] + [0] * 11, dtype=np.float32)
 
 
 def _face(track_id: str, person: int | None) -> TrackedBox:
@@ -371,8 +372,8 @@ def test_remembered_people_are_capped_and_the_oldest_is_dropped() -> None:
     people = _RememberedPeople()
     faces = list(np.eye(20, dtype=np.float32))
     for face in faces[:17]:
-        people.add(face)
-    people.add(faces[16])  # already remembered: not added twice
+        people.add(_Reference(face, 100))
+    people.add(_Reference(faces[16], 100))  # already remembered: not added twice
     assert len(people) == 16
     assert people.match(faces[0]) is None
     assert all(people.match(face) is not None for face in faces[1:17])
@@ -560,6 +561,223 @@ def test_steady_state_embeds_each_track_at_most_once_per_second(monkeypatch) -> 
         assert all(b - a >= 1.0 - 1e-9 for a, b in zip(track_times, track_times[1:]))
 
 
+# --- far-away faces (WP17) ---
+
+LARGE = (100.0, 100.0, 200.0, 220.0)  # 120 px tall
+SPOT = (300.0, 200.0, 320.0, 220.0)  # 20 px tall: too small for an embedding to be evidence
+
+
+def _at(box: tuple[float, float, float, float], dx: float = 0.0, scale: float = 1.0) -> tuple[float, float, float, float]:
+    """box moved right by dx and scaled about its centre."""
+    cx, cy = (box[0] + box[2]) / 2 + dx, (box[1] + box[3]) / 2
+    half_w, half_h = (box[2] - box[0]) * scale / 2, (box[3] - box[1]) * scale / 2
+    return (cx - half_w, cy - half_h, cx + half_w, cy + half_h)
+
+
+def _frame(identity: OwnerIdentity, policy: Policy, faces: dict[str, tuple[int, tuple]], now: float) -> list[str]:
+    """faces: track id -> (person, xyxy). Returns the owner ids."""
+    boxes = [
+        TrackedBox(id=track_id, label="face", xyxy=xyxy, conf=0.9, frame_index=0, last_seen=now,
+                   face_row=_row(person, xyxy[3] - xyxy[1]))
+        for track_id, (person, xyxy) in faces.items()
+    ]
+    identity.update(IMAGE, boxes, policy, now)
+    return [box.id for box in boxes if box.is_owner]
+
+
+def _frames(identity: OwnerIdentity, policy: Policy, faces: dict[str, tuple[int, tuple]], start: float, end: float) -> float:
+    now = start
+    while now < end - 1e-9:
+        _frame(identity, policy, faces, now)
+        now += FRAME_S
+    return now
+
+
+def _shown_then_far_away(identity: OwnerIdentity, policy: Policy, box: tuple = SPOT) -> float:
+    """STRANGER is unblurred close up on face#1, then walks away to `box`. Returns the next frame time."""
+    _frame(identity, policy, {"face#1": (STRANGER, LARGE)}, 0.0)
+    policy.set_track_override("face#1", "show")
+    now = _frames(identity, policy, {"face#1": (STRANGER, LARGE)}, FRAME_S, 0.5)
+    return _frames(identity, policy, {"face#1": (STRANGER, box)}, now, 1.0)
+
+
+def test_shown_small_face_with_a_garbage_embedding_is_never_revoked() -> None:
+    identity, embedder = _identity()
+    policy = Policy()
+    now = _shown_then_far_away(identity, policy)
+    calls = len(embedder.calls)
+    _frames(identity, policy, {"face#1": (OTHER, SPOT)}, now, now + 10.0)
+    assert _overrides(policy) == {"face#1": "show"}
+    assert len(embedder.calls) == calls  # too small: not even embedded
+
+
+def test_the_same_garbage_embedding_on_a_large_face_is_revoked_in_three_frames() -> None:
+    identity, embedder = _identity()
+    policy = Policy()
+    now = _shown_then_far_away(identity, policy, box=LARGE)
+    while _overrides(policy):
+        _frame(identity, policy, {"face#1": (OTHER, LARGE)}, now)
+        now += FRAME_S
+    assert embedder.calls.count(OTHER) == 3  # revoked on the third failed check, the first three frames in a row
+    assert embedder.calls[-3:] == [OTHER] * 3
+
+
+def test_a_small_face_is_never_newly_owner_or_re_shown_or_enrolled() -> None:
+    identity, embedder = _identity()
+    policy = Policy()
+    now = _unblur_then_leave(identity, policy, "face#1", STRANGER, 0.0)
+    calls = len(embedder.calls)
+    for i in range(45):  # 3 s: the owner and a remembered person, both far away
+        assert _frame(identity, policy, {"face#2": (OWNER, SPOT), "face#3": (STRANGER, _at(SPOT, 100))},
+                      now + i * FRAME_S) == []
+    assert _overrides(policy) == {"face#1": "show"}
+    assert len(embedder.calls) == calls
+    fresh, _ = _identity(enroll=False)
+    assert fresh.enroll(IMAGE, _row(OWNER, face_px=20)) is False
+    assert not fresh.enrolled
+
+
+def test_a_far_owner_stays_owner_and_a_near_one_is_still_checked() -> None:
+    identity, _ = _identity()
+    policy = Policy()
+    assert _frame(identity, policy, {"face#1": (OWNER, LARGE)}, 0.0) == ["face#1"]
+    now = _frames(identity, policy, {"face#1": (STRANGER, SPOT)}, FRAME_S, 5.0)
+    assert _frame(identity, policy, {"face#1": (STRANGER, SPOT)}, now) == ["face#1"]
+    owners = [_frame(identity, policy, {"face#1": (STRANGER, LARGE)}, now + (i + 1) * FRAME_S) for i in range(3)]
+    assert owners == [["face#1"], ["face#1"], []]
+
+
+# Unit vectors 60 degrees apart: neighbours match (cosine 0.5), FAR and NEARER do not (cosine -0.5).
+GROWING = {10: np.array([1.0, 0.0, 0.0]), 11: np.array([0.5, 0.866, 0.0]), 12: np.array([-0.5, 0.866, 0.0])}
+FAR, NEAR, NEARER = 10, 11, 12
+
+
+def _growing_identity() -> OwnerIdentity:
+    return OwnerIdentity(embed=lambda image, row: GROWING.get(int(row[0]), PEOPLE.get(int(row[0]))).astype(np.float32))
+
+
+def test_a_shown_track_that_grows_and_matches_gets_a_better_reference() -> None:
+    identity = _growing_identity()
+    policy = Policy()
+    small = _at(LARGE, scale=0.3)  # 36 px: checkable, but a poor reference
+    _frame(identity, policy, {"face#1": (FAR, small)}, 0.0)
+    policy.set_track_override("face#1", "show")
+    now = _frames(identity, policy, {"face#1": (FAR, small)}, FRAME_S, 1.5)
+    now = _frames(identity, policy, {"face#1": (NEAR, LARGE)}, now, 3.0)  # matches FAR: the reference is upgraded
+    now = _frames(identity, policy, {"face#1": (NEARER, LARGE)}, now, 6.0)  # matches NEAR only
+    assert _overrides(policy) == {"face#1": "show"}
+    now = _frames(identity, policy, {}, now, now + 1.0)
+    _frame(identity, policy, {"face#2": (NEARER, LARGE)}, now)  # remembered with the better embedding too
+    assert _overrides(policy) == {"face#1": "show", "face#2": "show"}
+
+
+def test_a_shown_track_that_grows_and_does_not_match_is_revoked_in_three_frames() -> None:
+    identity = _growing_identity()
+    policy = Policy()
+    small = _at(LARGE, scale=0.3)
+    _frame(identity, policy, {"face#1": (FAR, small)}, 0.0)
+    policy.set_track_override("face#1", "show")
+    now = _frames(identity, policy, {"face#1": (FAR, small)}, FRAME_S, 1.5)
+    first_failure = 2.1
+    _frames(identity, policy, {"face#1": (FAR, small)}, now, first_failure - 0.5)
+    for i in range(3):
+        assert _overrides(policy) == {"face#1": "show"}
+        _frame(identity, policy, {"face#1": (NEARER, LARGE)}, first_failure + i * FRAME_S)
+    assert _overrides(policy) == {}
+
+
+def _lose_far_shown_track(identity: OwnerIdentity, policy: Policy, others: dict | None = None) -> float:
+    """face#1 is shown and far away at SPOT, then the tracker loses it. Returns the frame time of the loss."""
+    now = _shown_then_far_away(identity, policy)
+    _frame(identity, policy, {"face#1": (STRANGER, SPOT), **(others or {})}, now)
+    return now + FRAME_S
+
+
+def test_hand_over_to_a_new_small_track_at_the_same_spot() -> None:
+    identity, _ = _identity()
+    policy = Policy()
+    now = _lose_far_shown_track(identity, policy)
+    _frame(identity, policy, {"face#2": (OTHER, _at(SPOT, 2))}, now)  # same frame the old id vanished
+    assert _overrides(policy) == {"face#1": "show", "face#2": "show"}
+    _frames(identity, policy, {"face#2": (OTHER, _at(SPOT, 2))}, now + FRAME_S, now + 3.0)
+    assert _overrides(policy) == {"face#1": "show", "face#2": "show"}  # still too small to check
+
+
+def test_hand_over_also_works_a_few_frames_later() -> None:
+    identity, _ = _identity()
+    policy = Policy()
+    now = _lose_far_shown_track(identity, policy)
+    now = _frames(identity, policy, {}, now, now + 0.25)
+    _frame(identity, policy, {"face#2": (OTHER, SPOT)}, now)
+    assert _overrides(policy)["face#2"] == "show"
+
+
+@pytest.mark.parametrize("case", ["too far", "too late", "too different in size", "two candidates", "large"])
+def test_no_hand_over(case: str) -> None:
+    identity, _ = _identity()
+    policy = Policy()
+    now = _lose_far_shown_track(identity, policy)
+    new_faces = {
+        "too far": {"face#2": (OTHER, _at(SPOT, 12))},
+        "too late": {"face#2": (OTHER, SPOT)},
+        "too different in size": {"face#2": (OTHER, _at(SPOT, scale=1.4))},
+        "two candidates": {"face#2": (OTHER, SPOT), "face#3": (OTHER, _at(SPOT, 3))},
+        "large": {"face#2": (OTHER, _at(SPOT, scale=1.7))},  # 34 px: checkable, so it must match by embedding
+    }[case]
+    if case == "too late":
+        now = _frames(identity, policy, {}, now, now + 0.5)
+    if case == "large":  # a lost track of 28 px so that 34 px is a similar size at the same spot
+        identity, _ = _identity()
+        policy = Policy()
+        now = _shown_then_far_away(identity, policy, box=_at(SPOT, scale=1.4))
+        now = _frames(identity, policy, {"face#1": (STRANGER, _at(SPOT, scale=1.4))}, now, now + 0.5)
+    _frames(identity, policy, new_faces, now, now + 2.0)
+    assert _overrides(policy) == {"face#1": "show"}
+
+
+def test_no_hand_over_when_another_face_was_near_at_loss() -> None:
+    identity, _ = _identity()
+    policy = Policy()
+    neighbour = {"face#9": (OTHER, _at(SPOT, 40))}
+    now = _lose_far_shown_track(identity, policy, others=neighbour)
+    _frames(identity, policy, {"face#2": (OTHER, SPOT), **neighbour}, now, now + 2.0)
+    assert _overrides(policy) == {"face#1": "show"}
+
+
+def test_hand_over_never_undoes_a_blur() -> None:
+    identity, _ = _identity()
+    policy = Policy()
+    now = _lose_far_shown_track(identity, policy)
+    policy.set_track_override("face#2", "blur")  # chosen before the new track was handed anything
+    _frames(identity, policy, {"face#2": (STRANGER, SPOT)}, now, now + 1.0)
+    assert _overrides(policy) == {"face#1": "show", "face#2": "blur"}
+    # The lost track itself blurred after it was lost: nothing to hand over.
+    identity, _ = _identity()
+    policy = Policy()
+    now = _lose_far_shown_track(identity, policy)
+    policy.set_track_override("face#1", "blur")
+    _frames(identity, policy, {"face#3": (STRANGER, SPOT)}, now, now + 1.0)
+    assert _overrides(policy) == {"face#1": "blur"}
+
+
+def test_blurring_all_faces_stops_hand_over() -> None:
+    identity, _ = _identity()
+    policy = Policy()
+    now = _lose_far_shown_track(identity, policy)
+    policy.set_class_rule("face", "blur")
+    _frames(identity, policy, {"face#2": (STRANGER, SPOT)}, now, now + 1.0)
+    assert _overrides(policy) == {}
+
+
+def test_owner_status_is_handed_over_to_a_new_small_track() -> None:
+    identity, _ = _identity()
+    policy = Policy()
+    assert _frame(identity, policy, {"face#1": (OWNER, LARGE)}, 0.0) == ["face#1"]
+    now = _frames(identity, policy, {"face#1": (OWNER, SPOT)}, FRAME_S, 1.0)
+    assert _frame(identity, policy, {"face#2": (STRANGER, SPOT)}, now) == ["face#2"]
+    assert _frame(identity, policy, {"face#3": (STRANGER, _at(SPOT, 40))}, now + FRAME_S) == []  # not at the spot
+
+
 # --- real SFace ---
 
 CLIPS_DIR = Path("/Users/luiz/Developer/privacy-cam/tests/data")
@@ -609,6 +827,12 @@ def _clip_faces(path: Path, step: int = 3, max_frames: int = 600) -> list[tuple[
     return frames
 
 
+def _xyxy(row: np.ndarray) -> tuple[float, float, float, float]:
+    """The YuNet row's box, so the face size seen by identity is the real one."""
+    x, y, w, h = (float(v) for v in row[:4])
+    return (x, y, x + w, y + h)
+
+
 def _sface() -> OwnerIdentity:
     return OwnerIdentity()
 
@@ -628,7 +852,7 @@ def test_clip_same_person_matches_across_frames(clip: Path) -> None:
     # rows are not ordered by person: follow the first face by position
     later_row = min(later_rows, key=lambda row: abs(row[0] - first_row[0]) + abs(row[1] - first_row[1]))
     identity.enroll(first_image, first_row)
-    box = TrackedBox(id="face#1", label="face", xyxy=(0, 0, 1, 1), conf=1.0, frame_index=0, last_seen=0.0,
+    box = TrackedBox(id="face#1", label="face", xyxy=_xyxy(later_row), conf=1.0, frame_index=0, last_seen=0.0,
                      face_row=later_row)
     identity.update(later_image, [box], Policy(), 0.0)
     assert box.is_owner
@@ -636,7 +860,8 @@ def test_clip_same_person_matches_across_frames(clip: Path) -> None:
 
 def _two_people_frame(clip: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     for image, rows in _clip_faces(clip):
-        if len(rows) >= 2 and rows[1][14] >= 0.8:
+        # WP17: both faces large enough for an embedding check (crossing.mov starts with a 15 px one)
+        if len(rows) >= 2 and rows[1][14] >= 0.8 and rows[1][3] >= _MIN_CHECK_PX:
             return image, rows[0], rows[1]
     pytest.skip(f"no frame with two confident faces in {clip.name}")
 
@@ -647,7 +872,7 @@ def test_clip_two_different_people_do_not_match(clip: Path) -> None:
     image, person_a, person_b = _two_people_frame(clip)
     identity = _sface()
     identity.enroll(image, person_a)
-    box = TrackedBox(id="face#1", label="face", xyxy=(0, 0, 1, 1), conf=1.0, frame_index=0, last_seen=0.0,
+    box = TrackedBox(id="face#1", label="face", xyxy=_xyxy(person_b), conf=1.0, frame_index=0, last_seen=0.0,
                      face_row=person_b)
     identity.update(image, [box], Policy(), 0.0)
     assert not box.is_owner
@@ -661,7 +886,7 @@ def test_clip_swapped_face_clears_the_override(clip: Path) -> None:
     policy = Policy()
 
     def frame(row: np.ndarray, now: float) -> None:
-        box = TrackedBox(id="face#7", label="face", xyxy=(0, 0, 1, 1), conf=1.0, frame_index=0, last_seen=now,
+        box = TrackedBox(id="face#7", label="face", xyxy=_xyxy(row), conf=1.0, frame_index=0, last_seen=now,
                          face_row=row)
         identity.update(image, [box], policy, now)
 
@@ -698,7 +923,7 @@ def test_clip_remembered_person_is_shown_under_a_new_track_id() -> None:
     policy = Policy()
 
     def frame(image: np.ndarray, rows: dict[str, np.ndarray], now: float) -> None:
-        boxes = [TrackedBox(id=track_id, label="face", xyxy=(0, 0, 1, 1), conf=1.0, frame_index=0, last_seen=now,
+        boxes = [TrackedBox(id=track_id, label="face", xyxy=_xyxy(row), conf=1.0, frame_index=0, last_seen=now,
                             face_row=row) for track_id, row in rows.items()]
         identity.update(image, boxes, policy, now)
 
@@ -708,6 +933,61 @@ def test_clip_remembered_person_is_shown_under_a_new_track_id() -> None:
     frame(later_image, {}, 1.0)  # left the frame
     frame(later_image, {"face#5": person, "face#6": other}, 2.0)  # several seconds later in the clip
     assert dict(policy.snapshot().track_overrides) == {"face#1": "show", "face#5": "show"}
+
+
+def _far_away(image: np.ndarray, row: np.ndarray, face_px: float) -> tuple[np.ndarray, np.ndarray] | None:
+    """The frame shrunk in memory so the face is face_px tall, on a grey 640x480 canvas, and its YuNet row."""
+    scale = face_px / float(row[3])
+    small = cv2.resize(image, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+    canvas = np.full_like(image, 110)
+    canvas[: small.shape[0], : small.shape[1]] = small
+    detector = cv2.FaceDetectorYN.create(
+        str(config.YUNET_MODEL), "", (canvas.shape[1], canvas.shape[0]), config.FACE_SCORE
+    )
+    _, rows = detector.detect(canvas)
+    if rows is None:
+        return None
+    centre = np.array([row[0] + row[2] / 2, row[1] + row[3] / 2]) * scale
+    distances = np.hypot(rows[:, 0] + rows[:, 2] / 2 - centre[0], rows[:, 1] + rows[:, 3] / 2 - centre[1])
+    nearest = int(np.argmin(distances))
+    return (canvas, rows[nearest]) if distances[nearest] < face_px / 2 else None
+
+
+@needs_models
+def test_clip_far_away_shown_person_keeps_the_show_override() -> None:
+    """The lead's complaint: a shown person far from the camera got blurred again.
+
+    The person is unblurred close up, then the same frames are shrunk so the face is
+    18 px tall for 2 s. Before WP17 every second's re-check embedded the tiny face,
+    failed three frames in a row and revoked the override (checked against the old
+    identity.py while writing this test); now a face that small is no evidence either way.
+    """
+    frames = _clip_faces(CROSSING_CLIP, step=1)
+    frames = [(image, rows[rows[:, 14] >= 0.8]) for image, rows in frames]
+    frames = [(image, rows) for image, rows in frames if len(rows) and rows[0][3] >= 80]
+    if len(frames) < 31:
+        pytest.skip("crossing.mov has too few close-up frames")
+    identity = _sface()
+    policy = Policy()
+
+    def frame(image: np.ndarray, row: np.ndarray, now: float) -> None:
+        box = TrackedBox(id="face#1", label="face", xyxy=_xyxy(row), conf=1.0, frame_index=0, last_seen=now,
+                         face_row=row)
+        identity.update(image, [box], policy, now)
+
+    first_image, first_rows = frames[0]
+    frame(first_image, first_rows[0], 0.0)
+    policy.set_track_override("face#1", "show")
+    frame(first_image, first_rows[0], FRAME_S)  # unblurred close up: reference saved
+    person = first_rows[0]
+    now = 2 * FRAME_S
+    for image, rows in frames[1:31]:  # 2 s at 15 FPS, the same person followed by position
+        person = rows[int(np.argmin(np.abs(rows[:, 0] - person[0]) + np.abs(rows[:, 1] - person[1])))]
+        far = _far_away(image, person, 18)
+        if far is not None:
+            frame(*far, now)
+        now += FRAME_S
+    assert dict(policy.snapshot().track_overrides) == {"face#1": "show"}
 
 
 @needs_models
