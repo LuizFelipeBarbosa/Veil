@@ -447,6 +447,7 @@ class _Speaker:
 
     def _run(self) -> None:
         stream = None
+        leftover = b""  # int16 frames are 2 bytes; a chunk may split one
         try:
             while (chunk := self._chunks.get()) is not None:
                 if stream is None:
@@ -456,7 +457,11 @@ class _Speaker:
                         samplerate=config.SPEAKER_SAMPLE_RATE, channels=1, dtype="int16"
                     )
                     stream.start()
-                stream.write(chunk)
+                data = leftover + chunk
+                whole = len(data) - len(data) % 2
+                leftover = data[whole:]
+                if whole:
+                    stream.write(data[:whole])
         except Exception as error:  # noqa: BLE001 - no speaker: replies stay text-only
             _log.warning("speaker failed, text-only replies: %s", error)
             while self._chunks.get() is not None:

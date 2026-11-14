@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import sys
 import time
 
 import pytest
@@ -342,6 +344,54 @@ def test_conversation_text_reaches_on_transcript() -> None:
     agent._dispatch({"type": "ConversationText", "role": "user", "content": "blur all faces"})
     agent._dispatch({"type": "ConversationText", "role": "assistant", "content": "Faces blurred."})
     assert lines == [("you", "blur all faces"), ("agent", "Faces blurred.")]
+
+
+class _FakeInputStream:
+    """Stands in for sounddevice.RawInputStream: no device is opened."""
+
+    opened: list["_FakeInputStream"] = []
+
+    def __init__(self, *, samplerate, channels, dtype, blocksize, callback) -> None:
+        assert (samplerate, channels, dtype) == (config.MIC_SAMPLE_RATE, 1, "int16")
+        self.callback = callback
+        self.running = False
+        _FakeInputStream.opened.append(self)
+
+    def start(self) -> None:
+        self.running = True
+
+    def stop(self) -> None:
+        self.running = False
+
+    def close(self) -> None:
+        self.running = False
+
+
+def test_talk_gate_streams_only_while_held_then_force_end_turn(monkeypatch: pytest.MonkeyPatch) -> None:
+    import types
+
+    monkeypatch.setitem(sys.modules, "sounddevice", types.SimpleNamespace(RawInputStream=_FakeInputStream))
+    _FakeInputStream.opened.clear()
+    handlers, _ = _handlers()
+    agent = VoiceAgent(handlers, lambda role, text: None, use_audio=True)
+    agent._speaker = None  # no playback thread work in this test
+    agent._ready.set()
+    run_loop = lambda: agent._loop.run_until_complete(asyncio.sleep(0))  # noqa: E731
+
+    agent._set_talking(True)
+    (mic,) = _FakeInputStream.opened
+    assert mic.running
+    mic.callback(b"\x01\x00" * 4, 4, None, None)
+    agent._set_talking(False)  # closes the mic; the audio scheduled above still goes first
+    mic.callback(b"\x02\x00" * 4, 4, None, None)  # a late callback after release is dropped
+    run_loop()
+
+    queued = []
+    while not agent._outbox.empty():
+        queued.append(agent._outbox.get_nowait())
+    assert not mic.running and agent._mic is None
+    assert queued == [b"\x01\x00" * 4, json.dumps({"type": "ForceEndTurn"})]
+    agent._loop.close()
 
 
 def test_an_agent_error_message_ends_the_session_without_touching_policy() -> None:
