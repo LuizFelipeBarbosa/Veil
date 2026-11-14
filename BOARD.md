@@ -18,7 +18,7 @@ Milestones: 13:00 faces blurred (Mac) | 14:00 owner + signs/plates | 14:45 voice
 | 15 | Remember unblurred people across track changes (session memory, by face) | merged 12:47 | 12:40–12:47 | wp15-remember-people | — |
 | 16 | Street signs: only street-name signs blur; stop, one-way and other traffic signs don't | merged 13:01; NCNN at 320 finds no signs on the clip | 12:54–13:00 | wp16-street-name-signs | lead: check intersection clip; Pi sign confidence |
 | 17 | Far-away shown faces flip to 'different person' and re-blur | merged 13:19 | 13:05–13:18 | wp17-far-faces | lead: try it live |
-| 18 | Phantom faces and big blurred building areas from the rotated face passes | running since 13:21 (25 min box) | 13:21–13:46 | wp18-rotated-false-faces | — |
+| 18 | Phantom faces and big blurred building areas from the rotated face passes | merged 13:36 | 13:21–13:34 | wp18-rotated-false-faces | lead: re-watch intersection clip |
 | 19 | Stop sign still blurred (generic sign prompt); far street-name sign missed | merged 13:33; far blue sign still missed on the Mac | 13:21–13:32 | wp19-sign-precision | lead: one-way distractor vs far street sign |
 | 8 | Integration (orchestrator) | all threads wired 12:03; live voice test pending | 12:03– | main | lead: hold T and speak |
 | 9 | Pi port (orchestrator + lead) | queued | 14:45–15:30 | main | needs WP8, the Pi |
