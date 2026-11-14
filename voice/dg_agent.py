@@ -45,19 +45,20 @@ The KNOWN TYPES are exactly: {", ".join(KNOWN_CLASSES)}.
 
 Pick one path for every command:
 
-A. A whole known type ("all faces", "the house numbers", "license plates", "storefront signs"):
+A. A whole known type ("all faces", "everyone", "the house numbers", "license plates"):
    call set_class_rule right away, no get_scene. Examples:
-   "blur all faces" -> set_class_rule(label="face", action="blur")
+   "blur all faces", "blur everyone", "blur people again" -> set_class_rule(label="face", action="blur")
+   "unblur everyone", "unblur all faces", "keep everyone unblurred", "people start unblurred"
+     -> set_class_rule(label="face", action="show"). That keeps new people unblurred too;
+     don't ask about it and don't say new people stay blurred.
    "pixelate the house numbers" -> set_class_rule(label="house number", action="blur")
    "hide all license plates" -> set_class_rule(label="license plate", action="blur")
    "unblur the license plates" -> set_class_rule(label="license plate", action="show")
    "show street signs" -> set_class_rule(label="street sign", action="show")
-   Never call set_class_rule with label "face" and action "show". For "unblur all faces",
-   "show all the faces", "show everyone": call get_scene, then set_track(id, "show") once for
-   EVERY face track whose state is "blur", and reply like "Done. New people stay blurred."
 
 B. Specific people or objects ("the person on my left", "the guy", "her", "my face",
-   "the plate on the right", "the sign behind me", "the two people on my left"), to blur OR show:
+   "the plate on the right", "the sign behind me", "the two people on my left"), to blur OR show,
+   also while a whole type is shown:
    1. Call get_scene first. Use only track ids from that latest scene.
    2. Find the tracks that fit. "my left"/"my right" = owner_left/owner_right. Without an owner,
       left, center, right are the operator's view. "the back", "behind me" = far, "close" = near.
@@ -71,13 +72,19 @@ B. Specific people or objects ("the person on my left", "the guy", "her", "my fa
       whole reply is one question ending in "?", like "Which one, left or right?" or
       "The one on your left or the one in the back?"
       Plural ("the two people on my left", "both plates", "them") -> one set_track per fit.
+   4. A short answer to your question ("closer", "the left one", "both") picks from the
+      candidates you asked about: act on it with set_track right away, never ask again.
+   5. set_track says the id is not in the live scene: call get_scene once more and retry
+      once with the new id at the same side and distance. Only then say it failed.
 
 C. Everything at once:
    "Unblur everything", "show everything", "unblur all" -> call show_all, no get_scene.
+   It shows every type, people included, and keeps new ones unblurred.
    "Blur everything", "panic", "hide it all" -> call blur_all.
    "Stop panic", "clear panic" -> call clear_panic.
    "Back to normal", "reset" -> call clear_panic, then set_class_rule(label, "blur") for EVERY
    known type, face included (that also re-blurs every person).
+   "Everyone" and "all faces" are path A, not this path.
 
 D. A type that is NOT a known type (logos, tattoos, cars, screens): call no tool and say
    "I can hide faces, plates, street signs, house numbers, storefronts."

@@ -7,7 +7,7 @@ import logging
 import re
 from typing import Any, Callable
 
-from contracts import ACTIONS, FACE, OBJECT_CLASSES, Policy, Scene
+from contracts import ACTIONS, FACE, KNOWN_CLASSES, Policy, Scene
 
 _log = logging.getLogger(__name__)
 
@@ -53,8 +53,10 @@ class ToolHandlers:
         action = _string_argument(arguments, "action").strip().lower()
         self._policy.set_class_rule(label, action)  # type: ignore[arg-type]
         result: dict[str, Any] = {"ok": True, "label": label, "action": action}
-        if label == FACE:
-            result["note"] = "every per-person override was cleared"
+        if label == FACE and action == "blur":
+            result["note"] = "everyone is blurred again; every per-person choice was cleared"
+        elif label == FACE:
+            result["note"] = "everyone is unblurred, including people who arrive later"
         return result
 
     def _set_track(self, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -68,15 +70,13 @@ class ToolHandlers:
         return {"ok": True, "track_id": track_id, "action": action}
 
     def _show_all(self) -> dict[str, Any]:
-        # The faces come from the live scene at call time; if it can't be read, nothing changes.
-        face_ids = [track.id for track in self._get_scene().tracks if track.label == FACE]
-        self._policy.show_all(face_ids)
+        self._policy.show_all()
         return {
             "ok": True,
-            "faces_shown": face_ids,
-            "classes_shown": list(OBJECT_CLASSES),
+            "classes_shown": list(KNOWN_CLASSES),
             "panic": False,
-            "note": "only people in view now; anyone who arrives later starts blurred",
+            "note": "everything stays unblurred, including people who arrive later; "
+            "things blurred one by one stay blurred",
         }
 
 
@@ -114,8 +114,10 @@ _PERSON_WORDS = {
     "left", "right", "middle", "center", "near", "far", "this", "that",
     "track", "id",
 }
-_BLUR_WORDS = {"blur", "hide", "pixelate", "censor", "cover", "mask", "block"}
-_SHOW_WORDS = {"unblur", "show", "reveal", "unhide", "uncover", "unpixelate", "unmask", "unblock"}
+_BLUR_WORDS = {"blur", "blurred", "hide", "hidden", "pixelate", "censor", "cover", "mask", "block"}
+_SHOW_WORDS = {
+    "unblur", "unblurred", "show", "shown", "reveal", "unhide", "uncover", "unpixelate", "unmask", "unblock",
+}
 _CLEAR_PANIC_PHRASES = (
     "clear panic", "clear the panic", "panic off", "stop panic", "stop the panic", "cancel panic",
     "end panic", "unpanic", "back to normal", "turn off panic", "turn panic off",
@@ -126,7 +128,7 @@ _PANIC_PHRASES = (
 )
 # Phrase -> known label. Checked longest first so "street signs" wins over "signs".
 _LABEL_PHRASES = {
-    "faces": FACE, "face": FACE,
+    "faces": FACE, "face": FACE, "everyone": FACE, "everybody": FACE,
     "license plates": "license plate", "license plate": "license plate",
     "number plates": "license plate", "number plate": "license plate",
     "plates": "license plate", "plate": "license plate",
@@ -139,7 +141,7 @@ _LABEL_PHRASES = {
     "store signs": "storefront sign", "shop signs": "storefront sign",
 }
 # show_all only when the whole command, minus these fillers, is one of the phrases below,
-# so "unblur all faces" or "show all the signs" never becomes show_all.
+# so "unblur all faces" (the face class) or "show all the signs" never becomes show_all.
 _SHOW_ALL_PHRASES = {
     f"{verb} {what}"
     for verb in ("unblur", "show", "reveal", "unhide", "uncover", "unpixelate")
@@ -147,13 +149,15 @@ _SHOW_ALL_PHRASES = {
 }
 _FILLER_WORDS = {"please", "now", "just", "ok", "okay", "hey", "can", "could", "you", "go", "ahead", "and"}
 _NEGATION_WORDS = {"don't", "dont", "not", "never", "no", "stop"}
+# "show my face" is about one person; "blur my face" may still blur the whole class (fails closed).
+_POSSESSIVE_WORDS = {"my", "his", "your", "their"}
 
 
 def parse_keywords(transcript: str) -> tuple[str, dict[str, Any]] | None:
     """Map a transcript to (tool name, arguments) without the model, or None if nothing matches.
 
     Only class-wide, show-everything and panic commands; anything about a specific person
-    returns None, and so does a negated show ("don't show the plates").
+    returns None, and so does a negated show ("don't show the plates") or "show my face".
     """
     if not isinstance(transcript, str):
         return None
@@ -166,8 +170,8 @@ def parse_keywords(transcript: str) -> tuple[str, dict[str, Any]] | None:
         return ("clear_panic", {})
     if _contains_phrase(text, _PANIC_PHRASES):
         return ("blur_all", {})
-    if words & _NEGATION_WORDS and words & _SHOW_WORDS:
-        return None  # a misheard "don't" must never unblur anything
+    if words & _SHOW_WORDS and words & (_NEGATION_WORDS | _POSSESSIVE_WORDS):
+        return None  # a misheard "don't", or "show my face", must never unblur everyone
     if " ".join(word for word in text.split() if word not in _FILLER_WORDS) in _SHOW_ALL_PHRASES:
         return ("show_all", {})
 
@@ -175,11 +179,8 @@ def parse_keywords(transcript: str) -> tuple[str, dict[str, Any]] | None:
     wants_blur, wants_show = bool(words & _BLUR_WORDS), bool(words & _SHOW_WORDS)
     if len(labels) != 1 or wants_blur == wants_show:
         return None  # nothing, or more than one thing, to act on
-    label = labels.pop()
     action = "show" if wants_show else "blur"
-    if label == FACE and action == "show":
-        return None  # faces are only ever shown one person at a time, by the model
-    return ("set_class_rule", {"label": label, "action": action})
+    return ("set_class_rule", {"label": labels.pop(), "action": action})
 
 
 def _contains_phrase(text: str, phrases: tuple[str, ...]) -> bool:

@@ -24,12 +24,32 @@ def _handlers(scene: Scene = scenes.OWNER_AND_FRIEND_LEFT) -> tuple[ToolHandlers
 # --- hard limits ---
 
 
-def test_showing_the_face_class_is_refused() -> None:
+def test_showing_the_face_class_keeps_everyone_unblurred() -> None:
     handlers, policy = _handlers()
-    before = policy.to_dict()
     result = handlers.handle("set_class_rule", {"label": "face", "action": "show"})
-    assert result["ok"] is False and result["error"]
-    assert policy.to_dict() == before
+    assert result["ok"] is True and "later" in result["note"]
+    assert policy.snapshot().class_rules[FACE] == "show"
+    assert policy.snapshot().face_reset_count == 0
+
+
+def test_blurring_the_face_class_after_showing_it_blurs_everyone_again() -> None:
+    handlers, policy = _handlers()
+    assert handlers.handle("set_class_rule", {"label": "face", "action": "show"})["ok"]
+    assert handlers.handle("set_track", {"track_id": "face#7", "action": "blur"})["ok"]
+    result = handlers.handle("set_class_rule", {"label": "face", "action": "blur"})
+    assert result["ok"] is True and "cleared" in result["note"]
+    snapshot = policy.snapshot()
+    assert snapshot.class_rules[FACE] == "blur"
+    assert snapshot.track_overrides == {}
+    assert snapshot.face_reset_count == 1
+
+
+def test_one_person_can_be_blurred_while_the_face_class_is_shown() -> None:
+    handlers, policy = _handlers()
+    assert handlers.handle("set_class_rule", {"label": "face", "action": "show"})["ok"]
+    assert handlers.handle("set_track", {"track_id": "face#7", "action": "blur"})["ok"]
+    assert policy.snapshot().class_rules[FACE] == "show"
+    assert policy.snapshot().track_overrides == {"face#7": "blur"}
 
 
 def test_blurring_faces_clears_face_overrides() -> None:
@@ -135,58 +155,47 @@ def test_get_scene_returns_the_scene_dict() -> None:
         assert handlers.handle("get_scene", {}) == {"ok": True, **scene.to_dict()}
 
 
-# --- show_all: everything in view now, never the face class ---
+# --- show_all: every class, faces included; per-track blur choices stay ---
 
 
-def test_show_all_unblurs_objects_and_the_scenes_faces_but_not_the_face_class() -> None:
+def test_show_all_shows_every_class_and_turns_panic_off() -> None:
     handlers, policy = _handlers(scenes.OWNER_AND_FRIEND_LEFT)
     policy.set_panic(True)
     result = handlers.handle("show_all", {})
     assert result["ok"] is True
-    assert result["faces_shown"] == ["face#2", "face#7"]
-    assert set(result["classes_shown"]) == set(OBJECT_CLASSES)
+    assert set(result["classes_shown"]) == set(KNOWN_CLASSES)
     snapshot = policy.snapshot()
-    assert snapshot.class_rules[FACE] == "blur"
-    assert all(snapshot.class_rules[label] == "show" for label in OBJECT_CLASSES)
-    assert dict(snapshot.track_overrides) == {"face#2": "show", "face#7": "show"}
+    assert all(snapshot.class_rules[label] == "show" for label in KNOWN_CLASSES)
+    assert snapshot.track_overrides == {}
     assert snapshot.panic is False
 
 
-def test_show_all_with_an_empty_scene_shows_only_object_classes() -> None:
-    handlers, policy = _handlers(scenes.EMPTY)
-    result = handlers.handle("show_all", {})
-    assert result["ok"] is True and result["faces_shown"] == []
-    snapshot = policy.snapshot()
-    assert snapshot.class_rules[FACE] == "blur"
-    assert all(snapshot.class_rules[label] == "show" for label in OBJECT_CLASSES)
-    assert snapshot.track_overrides == {}
+def test_show_all_keeps_things_blurred_one_by_one() -> None:
+    handlers, policy = _handlers(scenes.OWNER_AND_FRIEND_LEFT)
+    assert handlers.handle("set_track", {"track_id": "obj#3", "action": "blur"})["ok"]
+    assert handlers.handle("show_all", {})["ok"]
+    assert policy.snapshot().track_overrides == {"obj#3": "blur"}
 
 
-def test_show_all_when_the_scene_source_breaks_changes_nothing() -> None:
+def test_show_all_does_not_need_the_scene() -> None:
     def broken() -> Scene:
         raise RuntimeError("vision is down")
 
     policy = Policy()
-    policy.set_panic(True)
-    before = policy.to_dict()
     result = ToolHandlers(policy, broken).handle("show_all", {})
-    assert result["ok"] is False and isinstance(result["error"], str)
-    assert policy.to_dict() == before  # fail closed: still panicking, nothing shown
-
-
-def test_the_face_class_still_cannot_be_shown_after_show_all() -> None:
-    handlers, policy = _handlers()
-    assert handlers.handle("show_all", {})["ok"]
-    result = handlers.handle("set_class_rule", {"label": "face", "action": "show"})
-    assert result["ok"] is False
-    assert policy.snapshot().class_rules[FACE] == "blur"
+    assert result["ok"] is True
+    assert policy.snapshot().class_rules[FACE] == "show"
 
 
 def test_blurring_faces_after_show_all_reblurs_every_person() -> None:
     handlers, policy = _handlers()
     assert handlers.handle("show_all", {})["ok"]
+    assert handlers.handle("set_track", {"track_id": "face#7", "action": "show"})["ok"]
     assert handlers.handle("set_class_rule", {"label": "face", "action": "blur"})["ok"]
-    assert policy.snapshot().track_overrides == {}
+    snapshot = policy.snapshot()
+    assert snapshot.class_rules[FACE] == "blur"
+    assert snapshot.track_overrides == {}
+    assert all(snapshot.class_rules[label] == "show" for label in OBJECT_CLASSES)
 
 
 # --- handle never raises ---
@@ -259,6 +268,12 @@ def test_a_broken_scene_source_is_a_refusal() -> None:
         ("Unblur all.", ("show_all", {})),
         ("okay, unblur it all please", ("show_all", {})),
         ("show all the plates", ("set_class_rule", {"label": "license plate", "action": "show"})),
+        ("unblur everyone", ("set_class_rule", {"label": "face", "action": "show"})),
+        ("Unblur all faces.", ("set_class_rule", {"label": "face", "action": "show"})),
+        ("keep everyone unblurred", ("set_class_rule", {"label": "face", "action": "show"})),
+        ("show all the faces", ("set_class_rule", {"label": "face", "action": "show"})),
+        ("blur everyone", ("set_class_rule", {"label": "face", "action": "blur"})),
+        ("keep everybody blurred", ("set_class_rule", {"label": "face", "action": "blur"})),
     ],
 )
 def test_keyword_parser_matches(transcript: str, expected) -> None:
@@ -274,42 +289,33 @@ def test_keyword_parser_matches(transcript: str, expected) -> None:
         "show face#7",
         "blur the one in the back",
         "hide the logos",
-        "show all faces",
-        "unblur the faces",
         "blur faces and show plates",
         "hide plates and street signs",
         "hello there",
         "",
-        "unblur all faces",
-        "show all the faces",
-        "unblur everyone",
         "show all the signs",
         "unblur all the logos",
         "unblur everything except me",
         "don't unblur everything",
         "do not show the plates",
+        "don't unblur everyone",
+        "never show faces",
     ],
 )
 def test_keyword_parser_declines(transcript: str) -> None:
     assert parse_keywords(transcript) is None
 
 
-def test_keyword_parser_never_shows_faces() -> None:
+def test_keyword_parser_never_turns_a_face_command_into_show_all() -> None:
     for verb in ("show", "unblur", "reveal", "unhide"):
-        for noun in ("face", "faces", "all faces", "everyone's faces"):
-            assert parse_keywords(f"{verb} {noun}") is None
-            assert parse_keywords(f"{verb} all {noun}") is None
+        for noun in ("face", "faces", "all faces", "everyone", "all the faces"):
+            assert parse_keywords(f"{verb} {noun}") == ("set_class_rule", {"label": FACE, "action": "show"})
 
 
-def test_keyword_parser_never_produces_face_show() -> None:
-    verbs = ("show", "unblur", "reveal", "unhide", "uncover")
-    middles = ("", "all", "all the", "every", "everything and", "the")
-    nouns = ("face", "faces", "everything", "all", "people", "everyone", "plates")
-    for verb in verbs:
-        for middle in middles:
-            for noun in nouns:
-                match = parse_keywords(f"{verb} {middle} {noun}")
-                assert match is None or match[1] != {"label": FACE, "action": "show"}
+def test_keyword_parser_never_shows_one_person() -> None:
+    for verb in ("show", "unblur", "reveal"):
+        for who in ("her", "him", "the guy", "the person on my left", "face#7", "my face"):
+            assert parse_keywords(f"{verb} {who}") is None
 
 
 def test_keyword_parser_ignores_non_strings() -> None:
@@ -327,8 +333,7 @@ def test_keyword_show_all_runs_through_the_handlers() -> None:
     handlers, policy = _handlers(scenes.TWO_CANDIDATES)
     name, arguments = parse_keywords("unblur everything")
     assert handlers.handle(name, arguments)["ok"]
-    assert set(policy.snapshot().track_overrides) == {"face#2", "face#7", "face#9"}
-    assert policy.snapshot().class_rules[FACE] == "blur"
+    assert all(policy.snapshot().class_rules[label] == "show" for label in KNOWN_CLASSES)
 
 
 # --- settings (offline) ---
@@ -410,7 +415,7 @@ def test_function_call_requests_get_function_call_responses() -> None:
         "functions": [
             {"id": "fc_1", "name": "get_scene", "arguments": "{}", "client_side": True},
             {"id": "fc_2", "name": "set_track", "arguments": '{"track_id": "face#7", "action": "show"}', "client_side": True},
-            {"id": "fc_3", "name": "set_class_rule", "arguments": '{"label": "face", "action": "show"}', "client_side": True},
+            {"id": "fc_3", "name": "set_class_rule", "arguments": '{"label": "logo", "action": "show"}', "client_side": True},
             {"id": "fc_4", "name": "set_track", "arguments": "not json", "client_side": True},
             {"id": "fc_5", "name": "server_thing", "arguments": "{}", "client_side": False},
             "garbage",
