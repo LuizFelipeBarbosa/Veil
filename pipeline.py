@@ -69,6 +69,8 @@ class Pipeline(threading.Thread):
         self._object_hold_over = render.HoldOver()
         self._last_object_result_index = -1
         self._seen_track_ids: set[str] = set()
+        self._confirmed_face_ids: set[str] = set()
+        self._unconfirmed_boxes: dict[str, list[TrackedBox]] = {}  # track id -> weak boxes waiting in the buffer
         self._owner_id: str | None = None
         self._owner_lost_at: dict[str, int] = {}  # track id -> frame index where it stopped being the owner
         self._enroll_requested = threading.Event()
@@ -141,6 +143,7 @@ class Pipeline(threading.Thread):
         now = time.monotonic()
         detections = self._faces.detect(frame.image)
         tracked = _without_weak_duplicates(self._face_tracker.update(detections, frame.index, now))
+        tracked = self._confirmed_faces(tracked, frame.index)
         if self._enroll_requested.is_set():
             self._enroll_largest_face(frame.image, tracked)
         self._identity.update(frame.image, tracked, self._policy, now)
@@ -161,6 +164,35 @@ class Pipeline(threading.Thread):
         scene = policy_rules.build_scene(visible, self._policy.snapshot(), config.FRAME_WIDTH, config.FRAME_HEIGHT)
         with self._latest_lock:
             self._scene = scene
+
+    def _confirmed_faces(self, tracked: list[TrackedBox], frame_index: int) -> list[TrackedBox]:
+        """Only the boxes of tracks that have scored config.FACE_CONFIRM_SCORE at least once.
+
+        A weak box of a track not confirmed yet waits. If the track is confirmed while
+        its frames are still in the delay buffer, the waiting boxes are put on those
+        frames, so the face is blurred from its first weak sighting. A track that never
+        gets there (a pattern on a wall) is never blurred.
+        """
+        buffered = {frame.index: frame for frame in self._ring.recent(config.DELAY_BUFFER_FRAMES)}
+        confirmed: list[TrackedBox] = []
+        for box in tracked:
+            if box.conf >= config.FACE_CONFIRM_SCORE and box.id not in self._confirmed_face_ids:
+                self._confirmed_face_ids.add(box.id)
+                for waiting in self._unconfirmed_boxes.pop(box.id, []):
+                    if waiting.frame_index in buffered:
+                        buffered[waiting.frame_index].boxes.append(waiting)
+            if box.id in self._confirmed_face_ids:
+                confirmed.append(box)
+            else:
+                self._unconfirmed_boxes.setdefault(box.id, []).append(box)
+
+        oldest_buffered = frame_index - config.DELAY_BUFFER_FRAMES
+        self._unconfirmed_boxes = {
+            track_id: boxes
+            for track_id, boxes in self._unconfirmed_boxes.items()
+            if boxes[-1].frame_index >= oldest_buffered
+        }
+        return confirmed
 
     def _new_object_boxes(self) -> list[TrackedBox]:
         """Tracked boxes from a YOLOE result not handled yet, else nothing (hold-over bridges the gap).

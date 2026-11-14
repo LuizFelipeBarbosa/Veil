@@ -36,7 +36,10 @@ CAMERA_FACES_OPERATOR = not _ON_PI
 
 # --- faces (YuNet) and owner (SFace) ---
 YUNET_INPUT_SIZE = (320, 240) if _ON_PI else (640, 480)  # (width, height)
-FACE_SCORE = 0.4  # Brief: 0.6. Lowered after the leak test (real faces scored 0.3-0.6 went unblurred); 0.3 blurred too much
+FACE_SCORE = 0.4  # Brief: 0.6. Real faces scored 0.3-0.6 in the leak test and went unblurred
+# A face track is blurred only once it has scored this at least once. Equal to FACE_SCORE: gate off.
+# 0.5 stops a static false hit (a wall pattern) from blurring, but let 2 confident faces through on crossing.mov.
+FACE_CONFIRM_SCORE = FACE_SCORE
 SFACE_COSINE_MATCH = 0.363
 ID_RECHECK_S = 1.0
 
