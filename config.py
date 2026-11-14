@@ -26,9 +26,11 @@ YOLOE_NCNN_MODEL = WEIGHTS_DIR / "yoloe-26n-seg_ncnn_model"
 CAMERA_INDEX = 0  # Mac: built-in camera. Pi: the USB webcam.
 FRAME_WIDTH = 640
 FRAME_HEIGHT = 480
-FPS = 15
-DELAY_BUFFER_FRAMES = 15  # 1 s at 15 FPS
-BACKFILL_FRAMES = 10  # frames before a new face that get blurred too
+# Pi 4: one frame's face detection (upright + 2 rotated YuNet passes) takes about 155 ms next to
+# YOLOE. A frame period shorter than that starves the vision loop and every frame fails closed.
+FPS = 5 if _ON_PI else 15
+DELAY_BUFFER_FRAMES = FPS  # 1 s
+BACKFILL_FRAMES = round(FPS * 2 / 3)  # frames before a new face that get blurred too (about 0.67 s)
 
 # True when the camera points at the operator (laptop camera): the operator's
 # left is then the right side of the image. False for a camera pointing away.

@@ -248,7 +248,8 @@ class Pipeline(threading.Thread):
         if not candidates:
             return  # keep the request until a confident face shows up
         largest = max(candidates, key=lambda box: (box.xyxy[2] - box.xyxy[0]) * (box.xyxy[3] - box.xyxy[1]))
-        self._identity.enroll(image, largest.face_row)
+        if not self._identity.enroll(image, largest.face_row):
+            return  # face too small to learn: keep the request until the owner is closer
         self._enroll_requested.clear()
         log.info("owner enrolled from %s", largest.id)
 
