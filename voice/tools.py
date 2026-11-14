@@ -7,13 +7,13 @@ import logging
 import re
 from typing import Any, Callable
 
-from contracts import ACTIONS, FACE, Policy, Scene
+from contracts import ACTIONS, FACE, OBJECT_CLASSES, Policy, Scene
 
 _log = logging.getLogger(__name__)
 
 
 class ToolHandlers:
-    """Runs the 5 client-side tools against the local Policy and the live Scene."""
+    """Runs the 6 client-side tools against the local Policy and the live Scene."""
 
     def __init__(self, policy: Policy, get_scene: Callable[[], Scene]) -> None:
         self._policy = policy
@@ -39,6 +39,8 @@ class ToolHandlers:
             if name == "clear_panic":
                 self._policy.set_panic(False)
                 return {"ok": True, "panic": False}
+            if name == "show_all":
+                return self._show_all()
             return _refuse(f"unknown tool {name!r}")
         except ValueError as error:  # contracts.Policy's hard limits, bad arguments
             return _refuse(str(error))
@@ -64,6 +66,18 @@ class ToolHandlers:
             return _refuse(f"track {track_id!r} is not in the live scene; call get_scene again")
         self._policy.set_track_override(track_id, action)  # type: ignore[arg-type]
         return {"ok": True, "track_id": track_id, "action": action}
+
+    def _show_all(self) -> dict[str, Any]:
+        # The faces come from the live scene at call time; if it can't be read, nothing changes.
+        face_ids = [track.id for track in self._get_scene().tracks if track.label == FACE]
+        self._policy.show_all(face_ids)
+        return {
+            "ok": True,
+            "faces_shown": face_ids,
+            "classes_shown": list(OBJECT_CLASSES),
+            "panic": False,
+            "note": "only people in view now; anyone who arrives later starts blurred",
+        }
 
 
 def _refuse(error: str) -> dict[str, Any]:
@@ -124,12 +138,22 @@ _LABEL_PHRASES = {
     "storefronts": "storefront sign", "storefront": "storefront sign",
     "store signs": "storefront sign", "shop signs": "storefront sign",
 }
+# show_all only when the whole command, minus these fillers, is one of the phrases below,
+# so "unblur all faces" or "show all the signs" never becomes show_all.
+_SHOW_ALL_PHRASES = {
+    f"{verb} {what}"
+    for verb in ("unblur", "show", "reveal", "unhide", "uncover", "unpixelate")
+    for what in ("everything", "all", "it all", "all of it", "everything again", "all again")
+}
+_FILLER_WORDS = {"please", "now", "just", "ok", "okay", "hey", "can", "could", "you", "go", "ahead", "and"}
+_NEGATION_WORDS = {"don't", "dont", "not", "never", "no", "stop"}
 
 
 def parse_keywords(transcript: str) -> tuple[str, dict[str, Any]] | None:
     """Map a transcript to (tool name, arguments) without the model, or None if nothing matches.
 
-    Only class-wide and panic commands; anything about a specific person returns None.
+    Only class-wide, show-everything and panic commands; anything about a specific person
+    returns None, and so does a negated show ("don't show the plates").
     """
     if not isinstance(transcript, str):
         return None
@@ -142,6 +166,10 @@ def parse_keywords(transcript: str) -> tuple[str, dict[str, Any]] | None:
         return ("clear_panic", {})
     if _contains_phrase(text, _PANIC_PHRASES):
         return ("blur_all", {})
+    if words & _NEGATION_WORDS and words & _SHOW_WORDS:
+        return None  # a misheard "don't" must never unblur anything
+    if " ".join(word for word in text.split() if word not in _FILLER_WORDS) in _SHOW_ALL_PHRASES:
+        return ("show_all", {})
 
     labels = _labels_in(text)
     wants_blur, wants_show = bool(words & _BLUR_WORDS), bool(words & _SHOW_WORDS)

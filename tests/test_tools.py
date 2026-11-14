@@ -135,6 +135,60 @@ def test_get_scene_returns_the_scene_dict() -> None:
         assert handlers.handle("get_scene", {}) == {"ok": True, **scene.to_dict()}
 
 
+# --- show_all: everything in view now, never the face class ---
+
+
+def test_show_all_unblurs_objects_and_the_scenes_faces_but_not_the_face_class() -> None:
+    handlers, policy = _handlers(scenes.OWNER_AND_FRIEND_LEFT)
+    policy.set_panic(True)
+    result = handlers.handle("show_all", {})
+    assert result["ok"] is True
+    assert result["faces_shown"] == ["face#2", "face#7"]
+    assert set(result["classes_shown"]) == set(OBJECT_CLASSES)
+    snapshot = policy.snapshot()
+    assert snapshot.class_rules[FACE] == "blur"
+    assert all(snapshot.class_rules[label] == "show" for label in OBJECT_CLASSES)
+    assert dict(snapshot.track_overrides) == {"face#2": "show", "face#7": "show"}
+    assert snapshot.panic is False
+
+
+def test_show_all_with_an_empty_scene_shows_only_object_classes() -> None:
+    handlers, policy = _handlers(scenes.EMPTY)
+    result = handlers.handle("show_all", {})
+    assert result["ok"] is True and result["faces_shown"] == []
+    snapshot = policy.snapshot()
+    assert snapshot.class_rules[FACE] == "blur"
+    assert all(snapshot.class_rules[label] == "show" for label in OBJECT_CLASSES)
+    assert snapshot.track_overrides == {}
+
+
+def test_show_all_when_the_scene_source_breaks_changes_nothing() -> None:
+    def broken() -> Scene:
+        raise RuntimeError("vision is down")
+
+    policy = Policy()
+    policy.set_panic(True)
+    before = policy.to_dict()
+    result = ToolHandlers(policy, broken).handle("show_all", {})
+    assert result["ok"] is False and isinstance(result["error"], str)
+    assert policy.to_dict() == before  # fail closed: still panicking, nothing shown
+
+
+def test_the_face_class_still_cannot_be_shown_after_show_all() -> None:
+    handlers, policy = _handlers()
+    assert handlers.handle("show_all", {})["ok"]
+    result = handlers.handle("set_class_rule", {"label": "face", "action": "show"})
+    assert result["ok"] is False
+    assert policy.snapshot().class_rules[FACE] == "blur"
+
+
+def test_blurring_faces_after_show_all_reblurs_every_person() -> None:
+    handlers, policy = _handlers()
+    assert handlers.handle("show_all", {})["ok"]
+    assert handlers.handle("set_class_rule", {"label": "face", "action": "blur"})["ok"]
+    assert policy.snapshot().track_overrides == {}
+
+
 # --- handle never raises ---
 
 
@@ -200,6 +254,11 @@ def test_a_broken_scene_source_is_a_refusal() -> None:
         ("clear panic", ("clear_panic", {})),
         ("Panic off.", ("clear_panic", {})),
         ("back to normal", ("clear_panic", {})),
+        ("Unblur everything.", ("show_all", {})),
+        ("show everything", ("show_all", {})),
+        ("Unblur all.", ("show_all", {})),
+        ("okay, unblur it all please", ("show_all", {})),
+        ("show all the plates", ("set_class_rule", {"label": "license plate", "action": "show"})),
     ],
 )
 def test_keyword_parser_matches(transcript: str, expected) -> None:
@@ -221,6 +280,14 @@ def test_keyword_parser_matches(transcript: str, expected) -> None:
         "hide plates and street signs",
         "hello there",
         "",
+        "unblur all faces",
+        "show all the faces",
+        "unblur everyone",
+        "show all the signs",
+        "unblur all the logos",
+        "unblur everything except me",
+        "don't unblur everything",
+        "do not show the plates",
     ],
 )
 def test_keyword_parser_declines(transcript: str) -> None:
@@ -231,6 +298,18 @@ def test_keyword_parser_never_shows_faces() -> None:
     for verb in ("show", "unblur", "reveal", "unhide"):
         for noun in ("face", "faces", "all faces", "everyone's faces"):
             assert parse_keywords(f"{verb} {noun}") is None
+            assert parse_keywords(f"{verb} all {noun}") is None
+
+
+def test_keyword_parser_never_produces_face_show() -> None:
+    verbs = ("show", "unblur", "reveal", "unhide", "uncover")
+    middles = ("", "all", "all the", "every", "everything and", "the")
+    nouns = ("face", "faces", "everything", "all", "people", "everyone", "plates")
+    for verb in verbs:
+        for middle in middles:
+            for noun in nouns:
+                match = parse_keywords(f"{verb} {middle} {noun}")
+                assert match is None or match[1] != {"label": FACE, "action": "show"}
 
 
 def test_keyword_parser_ignores_non_strings() -> None:
@@ -242,6 +321,14 @@ def test_keyword_matches_run_through_the_handlers() -> None:
     name, arguments = parse_keywords("hide license plates")
     assert handlers.handle(name, arguments)["ok"]
     assert policy.snapshot().class_rules["license plate"] == "blur"
+
+
+def test_keyword_show_all_runs_through_the_handlers() -> None:
+    handlers, policy = _handlers(scenes.TWO_CANDIDATES)
+    name, arguments = parse_keywords("unblur everything")
+    assert handlers.handle(name, arguments)["ok"]
+    assert set(policy.snapshot().track_overrides) == {"face#2", "face#7", "face#9"}
+    assert policy.snapshot().class_rules[FACE] == "blur"
 
 
 # --- settings (offline) ---
@@ -258,13 +345,15 @@ def test_settings_shape() -> None:
     think = agent["think"]
     assert think["provider"]["type"] == "open_ai" and think["provider"]["temperature"] == 0
     assert [f["name"] for f in think["functions"]] == [
-        "get_scene", "set_class_rule", "set_track", "blur_all", "clear_panic",
+        "get_scene", "set_class_rule", "set_track", "blur_all", "clear_panic", "show_all",
     ]
     assert all("endpoint" not in f for f in think["functions"])
     assert "get_scene" in think["prompt"]
     assert agent["speak"]["provider"]["model"].startswith("aura-2")
     for label in KNOWN_CLASSES:
         assert label in think["prompt"]
+    assert "show_all" in think["prompt"]
+    assert f"under {config.AGENT_REPLY_MAX_WORDS} words" in think["prompt"]
 
 
 # --- VoiceAgent without network, key or audio ---
