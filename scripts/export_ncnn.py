@@ -1,4 +1,4 @@
-"""One-off: YOLOE-26n + the 4 fixed classes -> NCNN at 320 px for the Pi (WP5).
+"""One-off: YOLOE-26n + the fixed prompts (vision.objects.PROMPTS) -> NCNN at 320 px for the Pi (WP5, WP20).
 
     python scripts/export_ncnn.py
 

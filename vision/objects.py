@@ -34,6 +34,14 @@ _PROMPT_LABELS: dict[str, str | None] = {
     "street name plate": "street sign",
     "house number": "house number",
     "storefront sign": "storefront sign",
+    # Ads (WP20): shown by default, replaceable. Measured on photo posters pasted with perspective
+    # onto clip frames: "ad on a screen" names a framed ad far more often than "advertisement" alone
+    # (0.4-0.9) and has no box on the clip itself. "advertising billboard" and "advertising poster"
+    # also helped but put boxes on the clip's storefronts at 0.27-0.3, which would show them.
+    "billboard": "billboard",
+    "poster": "poster",
+    "advertisement": "advertisement",
+    "ad on a screen": "advertisement",
     # Distractors: detected so they are not mistaken for the above, then ignored.
     "stop sign": None,
     "one way sign": None,

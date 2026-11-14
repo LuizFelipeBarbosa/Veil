@@ -7,7 +7,7 @@ from types import MappingProxyType
 import pytest
 
 import config
-from contracts import KNOWN_CLASSES, Policy, PolicySnapshot, TrackedBox
+from contracts import AD_CLASSES, EMPTY_SCENE, KNOWN_CLASSES, Policy, PolicySnapshot, TrackedBox
 from fakes import scenes
 from vision.policy import build_scene, decide
 
@@ -58,6 +58,50 @@ def test_blur_override_beats_a_show_class_rule() -> None:
 
 def test_owner_is_shown_without_an_override() -> None:
     assert decide(_box("face#2", is_owner=True), _snapshot()) == "show"
+
+
+# --- decide: ad replacement (WP20) ---
+
+
+def test_ads_are_shown_by_default_and_everything_else_blurred() -> None:
+    snapshot = Policy().snapshot()
+    for label in AD_CLASSES:
+        assert decide(_box("obj#1", label), snapshot) == "show"
+    assert decide(_box("obj#2", "storefront sign"), snapshot) == "blur"
+
+
+def test_a_replaced_ad_class_returns_replace() -> None:
+    policy = Policy()
+    policy.set_replacement("poster", "cola.png")
+    snapshot = policy.snapshot()
+    assert decide(_box("obj#1", "poster"), snapshot) == "replace"
+    assert decide(_box("obj#2", "billboard"), snapshot) == "show"
+
+
+def test_panic_and_track_overrides_beat_replace() -> None:
+    policy = Policy()
+    policy.set_replacement("billboard", "cola.png")
+    policy.set_track_override("obj#1", "blur")
+    policy.set_track_override("obj#2", "show")
+    snapshot = policy.snapshot()
+    assert decide(_box("obj#1", "billboard"), snapshot) == "blur"
+    assert decide(_box("obj#2", "billboard"), snapshot) == "show"
+    policy.set_panic(True)
+    assert decide(_box("obj#3", "billboard"), policy.snapshot()) == "blur"
+
+
+def test_replace_blurs_for_a_non_ad_label_an_unknown_label_or_a_missing_image() -> None:
+    rules = {label: "replace" for label in KNOWN_CLASSES}
+    replacements = {label: "cola.png" for label in KNOWN_CLASSES}
+    snapshot = PolicySnapshot(
+        class_rules=MappingProxyType(rules), track_overrides=MappingProxyType({}), panic=False, replacements=replacements
+    )
+    assert decide(_box("obj#1", "storefront sign"), snapshot) == "blur"
+    assert decide(_box("face#1"), snapshot) == "blur"
+    assert decide(_box("obj#2", "mystery"), snapshot) == "blur"
+    no_image = PolicySnapshot(class_rules=MappingProxyType(rules), track_overrides=MappingProxyType({}), panic=False)
+    assert decide(_box("obj#3", "poster"), no_image) == "blur"
+    assert decide(_box("obj#4", "poster"), snapshot) == "replace"
 
 
 def test_class_rule_applies_without_override_or_owner() -> None:
@@ -176,4 +220,4 @@ def test_scene_carries_panic_and_class_rules() -> None:
 
 
 def test_empty_scene() -> None:
-    assert build_scene([], Policy().snapshot(), WIDTH, HEIGHT).to_dict() == scenes.EMPTY.to_dict()
+    assert build_scene([], Policy().snapshot(), WIDTH, HEIGHT).to_dict() == EMPTY_SCENE.to_dict()
