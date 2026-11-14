@@ -32,26 +32,31 @@ _MIN_EDGE_SUPPORT = 0.3
 _APPROX_EPSILONS = (0.02, 0.04, 0.06)  # of the hull's perimeter, for approxPolyDP; the first that gives 4 corners
 _CANNY_LOW, _CANNY_HIGH = 50, 150
 _MIN_BOX_SIDE = 8  # px; smaller boxes are filled without a corner search
-# Per-sign alpha-beta filter on the corners: a constant-velocity prediction corrected by the measurement.
-# A found quad is precise (within ~2 px), so it corrects more than the box-derived shape, which jitters
-# with the detector's box (up to ~30 px a frame on the ad clip).
-_QUAD_GAIN = 0.6
-_BOX_GAIN = 0.25
-_VELOCITY_GAIN = 0.15  # share of the residual / dt added to the velocity
-_SHAPE_GAIN = 0.3  # weight of a newly found quad in the sign's box-relative shape
-_COAST_DECAY = 0.7  # velocity kept per frame while the box is a held-over one and no quad is found
-# A box overlapping a sign's last box this much is that sign, whatever its track id or label.
-_MIN_SAME_SIGN_IOU = 0.3
-# A found quad further than this share of the box diagonal (mean corner distance) from the prediction
-# is another outline (a poster inside the billboard, a passer-by) and is ignored.
-_MAX_QUAD_JUMP = 0.12
-# A found quad whose area differs from the sign's by more than this factor is the pane or the frame
-# around the panel, not the panel: ignored like a jump.
-_MAX_AREA_CHANGE = 1.3
-# After this many ignored quads in a row the sign has really moved (a fast pan): it restarts at the quad.
-_REJECTS_BEFORE_RESTART = 3
-# A box overlapping the sign's last box less than this has jumped: the sign restarts at the measurement.
-_MIN_STEADY_IOU = 0.5
+# Optical flow: features on the previous frame in and around the sign (the wall and frame edges around
+# it move with it; RANSAC drops a passer-by) follow the sign to this frame. Done on a half-size gray.
+_FLOW_SCALE = 0.5
+_FLOW_SURROUND = 0.3  # share of the sign's size added per side to the feature search area
+_MAX_FEATURES = 80
+_MIN_INLIERS = 8  # fewer, or under _MIN_INLIER_SHARE of the tracked features: the flow is lost
+_MIN_INLIER_SHARE = 0.4
+_RANSAC_PX = 1.5  # in the half-size image
+# Detections pull the flow back slowly: a found quad near the sign by this share per fresh detection,
+# the box only in position and size (it jitters by up to ~30 px), by less.
+_QUAD_GAIN = 0.3
+_BOX_GAIN = 0.02
+# A box overlapping a sign this much (intersection over the smaller area) is that sign, whatever its
+# track id or label; boxes overlapping one another this much are one sign.
+_MIN_SAME_SIGN_OVERLAP = 0.3
+# A sign whose bounds overlap its fresh box's less than this (IoU) disagrees grossly: it restarts there.
+# The detector's box jitters by up to ~30 px, which keeps a 200 px sign above 0.7.
+_MIN_AGREE_IOU = 0.5
+# Two signs whose quads overlap by this share of the smaller one are one panel tracked twice.
+_DUPLICATE_SHARE = 0.5
+# A found quad further than this share of the box diagonal (mean corner distance) from the followed sign
+# is another outline (a poster inside the billboard, a passer-by, texture) and is ignored: the flow is
+# more reliable than a far quad, and a sign that really moved away disagrees with its box and restarts.
+_MAX_QUAD_JUMP = 0.05
+_MAX_AREA_CHANGE = 1.15  # nor one whose area differs more than this factor: the pane or the frame around the panel
 # Scene cuts: the frame is shrunk to a 16 x 12 colour thumbnail; when this share of its cells changed by
 # more than _CUT_CELL_CHANGE levels since the last call, it is a cut. On the ad clip a hard cut changes
 # 62% of cells, a fast pan at most 8%.
@@ -83,26 +88,31 @@ def list_assets(directory: Path = config.ADS_DIR) -> tuple[str, ...]:
 
 
 class _Sign:
-    """One physical sign: its filtered corners and, once a quad was found, its shape relative to the box.
+    """One physical sign: its corners, followed from frame to frame by optical flow.
 
-    Matched to boxes by overlap, so a new track id or label for the same sign keeps the state.
+    Detections only start a sign, keep it alive and pull it slowly back when the flow drifts.
     """
 
-    def __init__(self, box: tuple[int, int, int, int], now: float) -> None:
-        self.box = box  # last box it was matched to (clipped)
-        self.box_seen: float | None = None  # its last_seen: an unchanged one is held over, not a new measurement
-        self.corners: np.ndarray | None = None  # frame px; set by the first update
-        self.velocity = np.zeros((4, 2), np.float32)  # px/s per corner
-        self.shape: np.ndarray | None = None  # corners in box-relative units (0..1), once a quad was found
-        self.rejected = 0  # found quads ignored in a row
-        self.updated = now
+    def __init__(self, found: np.ndarray | None, box: TrackedBox, xyxy: tuple[int, int, int, int], now: float) -> None:
+        # Frame px, top-left, top-right, bottom-right, bottom-left: the quad found in the box, else the box.
+        self.corners = found if found is not None else _box_corners(xyxy)
+        self.outlined = found is not None  # the corners come from a found quad, not only from a box
+        self.candidate: np.ndarray | None = None  # a box-started sign's last found quad, moved with the flow
+        # Where it may be drawn: its last fresh box, moved with the flow since (see AdReplacer.draw).
+        self.region = np.float32(xyxy)
+        self.asset_name = ""
+        self.seen = box.last_seen  # last_seen of the newest box supporting it (the detector's clock)
+        self.updated = now  # when that box first reached draw() (draw's clock): the hold-over counts from here
+        self.support = 0  # frames with a supporting box: the established sign wins an overlap
 
 
 class AdReplacer:
-    """Warps an ad image onto each replaced sign, with its corners filtered per sign.
+    """Warps an ad image onto each replaced sign, following each sign with optical flow.
 
-    Keeps only the loaded ad images, each sign's corners and a 16 x 12 thumbnail of the last frame
-    (576 averaged colours, to notice scene cuts): never a frame.
+    Keeps the loaded ad images, each sign's corners, a 16 x 12 thumbnail of the last frame (to notice
+    scene cuts) and the last frame as a downscaled grayscale image for the optical flow. That grayscale
+    copy is raw image content: it lives only in this object, in the vision thread's memory like the ring
+    buffer, and is never written, logged, returned or exposed.
     """
 
     def __init__(self, directory: Path = config.ADS_DIR) -> None:
@@ -110,40 +120,66 @@ class AdReplacer:
         self._assets: dict[str, np.ndarray | None] = {}  # None: missing or unreadable, logged once
         self._signs: list[_Sign] = []
         self._thumbnail: np.ndarray | None = None
+        self._gray: np.ndarray | None = None  # the last frame, gray, scaled by _FLOW_SCALE; never leaves
         self._newest_seen = float("-inf")  # newest last_seen of any box so far
-        self._stale_until = float("-inf")  # boxes last seen at or before this belong to the scene before a cut
+        # Boxes last seen at or before this belong to the scene before a cut, or to a sign dropped after the hold-over.
+        self._stale_until = float("-inf")
 
     def draw(
         self, image: np.ndarray, boxes: Sequence[TrackedBox], assets: Mapping[str, str], now: float
     ) -> np.ndarray:
-        """A copy of `image` with the asset for each box's label drawn over the sign.
+        """A copy of `image` with the asset for each sign's label drawn over the sign.
 
         `boxes` are the boxes whose decision is "replace"; `assets` maps label -> file name.
-        A box whose asset is missing or unreadable is left as it is. Overlapping boxes on one sign
-        (duplicate tracks, other labels) are drawn once. The drawing stays inside the box.
+        A box whose asset is missing or unreadable is left as it is. Boxes overlapping one another
+        (duplicate tracks, other labels, a box nested in another) are one sign, drawn once, and no two
+        drawn signs overlap. A sign is drawn only in a frame where a box supports it, and only inside
+        its region: its last fresh box (clipped to the frame) moved with the flow since; no margin.
         """
         out = image.copy()
         height, width = image.shape[:2]
+        gray = cv2.resize(cv2.cvtColor(image, cv2.COLOR_BGR2GRAY), None, fx=_FLOW_SCALE, fy=_FLOW_SCALE,
+                          interpolation=cv2.INTER_AREA)
+        previous_gray, self._gray = self._gray, gray
         if self._scene_cut(image):  # nothing from the old scene may carry over, not even held-over boxes
             self._signs = []
             self._stale_until = self._newest_seen
         self._newest_seen = max([self._newest_seen, *(box.last_seen for box in boxes)])
-        fresh = [box for box in boxes if box.last_seen > self._stale_until]
-        unmatched = list(self._signs)
-        for box in _one_per_sign(fresh):
-            asset = self._asset(assets.get(box.label, ""))
+        expired = [sign for sign in self._signs if now - sign.updated > config.HOLD_OVER_S]
+        self._stale_until = max([self._stale_until, *(sign.seen for sign in expired)])  # its held-over boxes too
+        self._signs = [sign for sign in self._signs if sign not in expired]
+
+        lost = {id(sign) for sign in self._signs if previous_gray is None or not _follow(sign, previous_gray, gray)}
+        supported: list[_Sign] = []
+        for box in _one_per_sign([box for box in boxes if box.last_seen > self._stale_until]):
             xyxy = _clipped(box.xyxy, width, height)
-            if asset is None or xyxy[2] - xyxy[0] < 2 or xyxy[3] - xyxy[1] < 2:
+            if self._asset(assets.get(box.label, "")) is None or xyxy[2] - xyxy[0] < 2 or xyxy[3] - xyxy[1] < 2:
                 continue
-            sign = max(unmatched, key=lambda s: _iou(s.box, xyxy), default=None)
-            if sign is None or _iou(sign.box, xyxy) < _MIN_SAME_SIGN_IOU:
-                sign = _Sign(xyxy, now)
+            candidates = [sign for sign in self._signs if sign not in supported]
+            sign = max(candidates, key=lambda s: _overlap(_bounds(s.corners), xyxy), default=None)
+            if sign is None or _overlap(_bounds(sign.corners), xyxy) < _MIN_SAME_SIGN_OVERLAP:
+                sign = _Sign(_find_quad(image, xyxy), box, xyxy, now)
                 self._signs.append(sign)
-            else:
-                unmatched.remove(sign)
-            _update(sign, _find_quad(image, xyxy), xyxy, box.last_seen, now)
-            _warp_into_box(out, image, asset, sign.corners, xyxy)
-        self._signs = [sign for sign in self._signs if now - sign.updated <= config.HOLD_OVER_S]
+            elif box.last_seen > sign.seen or id(sign) in lost:  # correct the flow; a lost sign restarts at its box
+                _correct(sign, image, xyxy, restart=id(sign) in lost)
+            sign.asset_name = assets[box.label]
+            if box.last_seen > sign.seen:
+                sign.seen, sign.updated = box.last_seen, now
+            sign.support += 1
+            supported.append(sign)
+
+        drawn: list[_Sign] = []
+        for sign in sorted(supported, key=lambda s: s.support, reverse=True):
+            clashing = [other for other in drawn if _quad_overlap(sign.corners, other.corners) > 0]
+            if clashing:  # another sign is drawn there: never an ad on an ad
+                if any(_quad_overlap(sign.corners, other.corners) >= _DUPLICATE_SHARE * min(
+                        cv2.contourArea(sign.corners), cv2.contourArea(other.corners)) for other in clashing):
+                    self._signs.remove(sign)  # the same panel tracked twice: the established one stays
+                continue
+            drawn.append(sign)
+            region = _clipped(_rounded(sign.region), width, height)
+            if region[2] - region[0] >= 2 and region[3] - region[1] >= 2:
+                _warp_into_box(out, image, self._asset(sign.asset_name), sign.corners, region)
         return out
 
     def _scene_cut(self, image: np.ndarray) -> bool:
@@ -178,67 +214,111 @@ class AdReplacer:
 
 
 def _one_per_sign(boxes: Sequence[TrackedBox]) -> list[TrackedBox]:
-    """Of boxes overlapping one sign, the freshest (then most confident): held-over copies are stale."""
+    """One box per group of overlapping boxes (nested or partly overlapping count, by the smaller box's
+    share): the freshest, then the largest. Held-over copies are stale; the largest is the whole panel."""
     kept: list[TrackedBox] = []
-    for box in sorted(boxes, key=lambda b: (b.last_seen, b.conf), reverse=True):
-        if all(_iou(box.xyxy, other.xyxy) < _MIN_SAME_SIGN_IOU for other in kept):
+    for box in sorted(boxes, key=lambda b: (b.last_seen, _area(b.xyxy)), reverse=True):
+        if all(_overlap(box.xyxy, other.xyxy) < _MIN_SAME_SIGN_OVERLAP for other in kept):
             kept.append(box)
     return kept
 
 
-def _update(
-    sign: _Sign, found: np.ndarray | None, xyxy: tuple[int, int, int, int], box_seen: float, now: float
-) -> None:
-    """One alpha-beta step: predict with the velocity, correct with the quad or else the box-relative shape."""
-    origin, size = np.float32(xyxy[:2]), np.float32([xyxy[2] - xyxy[0], xyxy[3] - xyxy[1]])
-    if sign.corners is None or _iou(sign.box, xyxy) < _MIN_STEADY_IOU:
-        _restart(sign, found, xyxy, box_seen, now)  # new, or the box jumped: no sliding from the old place
+def _follow(sign: _Sign, previous_gray: np.ndarray, gray: np.ndarray) -> bool:
+    """Moves the sign's corners and region by the motion of the scene in and around it.
+
+    False when the flow is lost (too few consistent features); a flat area with no features at all
+    gives no motion to follow, so the sign stays where it is and detections correct it.
+    """
+    x1, y1, x2, y2 = _bounds(sign.corners)
+    grow_x, grow_y = _FLOW_SURROUND * (x2 - x1), _FLOW_SURROUND * (y2 - y1)
+    height, width = gray.shape
+    left, top = max(0, int((x1 - grow_x) * _FLOW_SCALE)), max(0, int((y1 - grow_y) * _FLOW_SCALE))
+    right, bottom = min(width, int((x2 + grow_x) * _FLOW_SCALE) + 1), min(height, int((y2 + grow_y) * _FLOW_SCALE) + 1)
+    if right - left < 4 or bottom - top < 4:
+        return False
+    mask = np.zeros_like(gray)
+    mask[top:bottom, left:right] = 255
+    points = cv2.goodFeaturesToTrack(previous_gray, _MAX_FEATURES, 0.01, 4, mask=mask)
+    if points is None:
+        return True
+    moved, status, _ = cv2.calcOpticalFlowPyrLK(previous_gray, gray, points, None, winSize=(15, 15), maxLevel=2)
+    tracked = status.ravel() == 1
+    if tracked.sum() < _MIN_INLIERS:
+        return False
+    transform, inliers = cv2.estimateAffinePartial2D(
+        points[tracked], moved[tracked], method=cv2.RANSAC, ransacReprojThreshold=_RANSAC_PX
+    )
+    if transform is None or inliers.sum() < max(_MIN_INLIERS, _MIN_INLIER_SHARE * tracked.sum()):
+        return False
+    transform[:, 2] /= _FLOW_SCALE  # the same motion in full-size pixels
+    sign.corners = cv2.transform(sign.corners[None], transform)[0]
+    if sign.candidate is not None:
+        sign.candidate = cv2.transform(sign.candidate[None], transform)[0]
+    region = np.float32([sign.region[:2], sign.region[2:]])
+    moved_region = cv2.transform(region[None], transform)[0]
+    sign.region = np.float32([*moved_region.min(axis=0), *moved_region.max(axis=0)])
+    return True
+
+
+def _correct(sign: _Sign, image: np.ndarray, xyxy: tuple[int, int, int, int], restart: bool) -> None:
+    """A fresh detection: restart the sign there when its flow was lost or it disagrees grossly with the
+    box, else pull it a little towards the quad found in the box, or towards the box's position and size. A far quad is ignored."""
+    found = _find_quad(image, xyxy)
+    sign.region = np.float32(xyxy)
+    # A sign started from a box takes a quad found twice in a row at one place (moved with the flow):
+    # a single one may be texture that happens to fit the box.
+    confirmed = found is not None and sign.candidate is not None and not _is_other_outline(found, sign.candidate, xyxy)
+    on_screen = _clipped(_bounds(sign.corners), image.shape[1], image.shape[0])  # the box is clipped too
+    if restart or _iou(on_screen, xyxy) < _MIN_AGREE_IOU or (confirmed and not sign.outlined):
+        sign.corners = found if found is not None else _box_corners(xyxy)
+        sign.outlined, sign.candidate = found is not None, None
         return
-    dt = now - sign.updated
-    predicted = sign.corners + sign.velocity * dt
-    if found is not None and sign.shape is not None and _is_other_outline(found, predicted, size):
-        sign.rejected += 1
-        if sign.rejected >= _REJECTS_BEFORE_RESTART:  # consistently elsewhere: the sign moved, follow it
-            _restart(sign, found, xyxy, box_seen, now)
-            return
-        found = None  # a sign without a shape yet takes the first quad it finds
-    elif found is not None:
-        sign.rejected = 0
-    if found is not None:
-        measured, gain = found, _QUAD_GAIN
-        relative = (found - origin) / size
-        sign.shape = relative if sign.shape is None else _SHAPE_GAIN * relative + (1 - _SHAPE_GAIN) * sign.shape
-    elif box_seen != sign.box_seen:
-        shape = sign.shape if sign.shape is not None else _box_corners((0, 0, 1, 1))
-        measured, gain = origin + shape * size, _BOX_GAIN
-    else:  # a held-over box and no quad: nothing new, coast on the prediction
-        measured, gain = predicted, 0.0
-        sign.velocity *= _COAST_DECAY
-
-    residual = measured - predicted
-    sign.corners = predicted + gain * residual
-    if dt > 0:
-        sign.velocity += _VELOCITY_GAIN * residual / dt
-    sign.box, sign.box_seen, sign.updated = xyxy, box_seen, now
+    if not sign.outlined:
+        sign.candidate = found
+    if found is not None and not _is_other_outline(found, sign.corners, xyxy):
+        sign.corners = sign.corners + _QUAD_GAIN * (found - sign.corners)
+        return
+    x1, y1, x2, y2 = _bounds(sign.corners)
+    centre, size = np.float32([(x1 + x2) / 2, (y1 + y2) / 2]), np.float32([x2 - x1, y2 - y1])
+    box_centre = np.float32([(xyxy[0] + xyxy[2]) / 2, (xyxy[1] + xyxy[3]) / 2])
+    box_size = np.float32([xyxy[2] - xyxy[0], xyxy[3] - xyxy[1]])
+    scale = 1 + _BOX_GAIN * (box_size / np.maximum(size, 1) - 1)
+    sign.corners = centre + _BOX_GAIN * (box_centre - centre) + (sign.corners - centre) * scale
 
 
-def _restart(
-    sign: _Sign, found: np.ndarray | None, xyxy: tuple[int, int, int, int], box_seen: float, now: float
-) -> None:
-    """The sign starts where it is measured, standing still."""
-    origin, size = np.float32(xyxy[:2]), np.float32([xyxy[2] - xyxy[0], xyxy[3] - xyxy[1]])
-    sign.corners = found if found is not None else _box_corners(xyxy)
-    sign.shape = None if found is None else (found - origin) / size
-    sign.velocity = np.zeros((4, 2), np.float32)
-    sign.rejected = 0
-    sign.box, sign.box_seen, sign.updated = xyxy, box_seen, now
+def _is_other_outline(found: np.ndarray, corners: np.ndarray, xyxy: tuple[int, int, int, int]) -> bool:
+    """A quad far from the sign or of another size: a poster inside, a passer-by, the glass pane."""
+    jump = np.linalg.norm(found - corners, axis=1).mean()
+    area_change = cv2.contourArea(found) / max(1.0, cv2.contourArea(corners))
+    diagonal = np.hypot(xyxy[2] - xyxy[0], xyxy[3] - xyxy[1])
+    return jump > _MAX_QUAD_JUMP * diagonal or not 1 / _MAX_AREA_CHANGE <= area_change <= _MAX_AREA_CHANGE
 
 
-def _is_other_outline(found: np.ndarray, predicted: np.ndarray, size: np.ndarray) -> bool:
-    """A quad far from the prediction or of another size: a poster inside, a passer-by, the glass pane."""
-    jump = np.linalg.norm(found - predicted, axis=1).mean()
-    area_change = cv2.contourArea(found) / max(1.0, cv2.contourArea(predicted))
-    return jump > _MAX_QUAD_JUMP * np.linalg.norm(size) or not 1 / _MAX_AREA_CHANGE <= area_change <= _MAX_AREA_CHANGE
+def _quad_overlap(a: np.ndarray, b: np.ndarray) -> float:
+    """Area shared by two quads (their convex hulls), px."""
+    area, _ = cv2.intersectConvexConvex(cv2.convexHull(a.astype(np.float32)), cv2.convexHull(b.astype(np.float32)))
+    return area
+
+
+def _rounded(region: np.ndarray) -> tuple[int, int, int, int]:
+    """Whole pixels inside the region: a box that has not moved is drawn in exactly its own pixels."""
+    x1, y1, x2, y2 = (float(v) for v in region)
+    return int(np.ceil(x1 - 1e-3)), int(np.ceil(y1 - 1e-3)), int(np.floor(x2 + 1e-3)), int(np.floor(y2 + 1e-3))
+
+
+def _bounds(corners: np.ndarray) -> tuple[float, float, float, float]:
+    return (*corners.min(axis=0), *corners.max(axis=0))
+
+
+def _area(xyxy) -> float:
+    return max(0, xyxy[2] - xyxy[0]) * max(0, xyxy[3] - xyxy[1])
+
+
+def _overlap(a, b) -> float:
+    """Intersection over the smaller box's area: 1 for a box nested in another."""
+    inter = max(0, min(a[2], b[2]) - max(a[0], b[0])) * max(0, min(a[3], b[3]) - max(a[1], b[1]))
+    smaller = min(_area(a), _area(b))
+    return inter / smaller if smaller > 0 else 0.0
 
 
 def _grown(xyxy: tuple[int, int, int, int], width: int, height: int) -> tuple[int, int, int, int]:

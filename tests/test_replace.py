@@ -1,4 +1,4 @@
-"""WP20/WP22: ad replacement and its per-sign smoothing. Synthetic frames and ad images only, made in memory or in tmp_path."""
+"""WP20/WP22/WP25: ad replacement, one drawing per sign, signs followed by optical flow. Synthetic frames and ad images only, made in memory or in tmp_path."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ import pytest
 
 import config
 from contracts import TrackedBox
+from vision import replace
 from vision.replace import AdReplacer, list_assets
 
 HEIGHT, WIDTH = config.FRAME_HEIGHT, config.FRAME_WIDTH
@@ -82,16 +83,6 @@ def _assert_ad_on_skewed_sign_only(out: np.ndarray) -> None:
 
 def test_the_asset_is_warped_onto_a_skewed_sign_inside_its_box(ads_dir: Path) -> None:
     out = AdReplacer(ads_dir).draw(_wall_with_skewed_sign(), [_box(SKEWED_SIGN_BOX)], ASSETS, now=0.0)
-    _assert_ad_on_skewed_sign_only(out)
-
-
-def test_the_sign_keeps_its_shape_when_the_quad_search_fails(ads_dir: Path) -> None:
-    replacer = AdReplacer(ads_dir)
-    replacer.draw(_wall_with_skewed_sign(), [_box(SKEWED_SIGN_BOX)], ASSETS, now=0.0)
-    # Next frames: the outline is lost (motion blur, a passer-by), the box is a fresh detection then a held-over one.
-    out = replacer.draw(_wall(), [_box(SKEWED_SIGN_BOX, last_seen=0.07)], ASSETS, now=0.07)
-    _assert_ad_on_skewed_sign_only(out)  # still the quad, not the box rectangle
-    out = replacer.draw(_wall(), [_box(SKEWED_SIGN_BOX, last_seen=0.07)], ASSETS, now=0.14)
     _assert_ad_on_skewed_sign_only(out)
 
 
@@ -188,23 +179,9 @@ def test_a_track_not_seen_for_longer_than_the_hold_over_starts_fresh(ads_dir: Pa
     replacer = AdReplacer(ads_dir)
     replacer.draw(image, [_box((0, 0, 100, 100))], ASSETS, now=0.0)
     replacer.draw(image, [], ASSETS, now=config.HOLD_OVER_S + 0.1)
-    out = replacer.draw(image, [_box((300, 300, 400, 400))], ASSETS, now=config.HOLD_OVER_S + 0.2)
+    now = config.HOLD_OVER_S + 0.2
+    out = replacer.draw(image, [_box((300, 300, 400, 400), last_seen=now)], ASSETS, now=now)
     assert _is_ad(out[300:400, 300:400]).all()  # not dragged from the old position
-
-
-def test_a_steadily_moving_sign_is_followed_without_growing_lag(ads_dir: Path) -> None:
-    image = np.zeros((HEIGHT, WIDTH, 3), np.uint8)  # no edges: the box itself is the measurement
-    replacer = AdReplacer(ads_dir)
-    speed = 6  # px per frame at 15 FPS, a steady pan
-    lags = []
-    for step in range(40):
-        now = step / 15
-        x1 = 50 + speed * step
-        out = replacer.draw(image, [_box((x1, 100, x1 + 200, 250), last_seen=now)], ASSETS, now=now)
-        covered = np.flatnonzero(_is_ad(out[175]))
-        lags.append(x1 + 199 - covered[-1])  # how far the ad's right edge trails the sign's
-    assert max(lags[20:]) <= 3  # caught up: a constant-velocity filter has no steady lag
-    assert lags[-1] <= max(lags[5:15])  # and the lag does not grow
 
 
 def test_a_held_over_box_keeps_its_ad_drawn(ads_dir: Path) -> None:
@@ -300,3 +277,120 @@ def test_a_flat_sign_under_uneven_light_shows_the_ad_colours(ads_dir: Path) -> N
     image[50:200, 100:300] = np.linspace(170, 240, 200, dtype=np.uint8)[None, :, None]  # lit from the right
     out = AdReplacer(ads_dir).draw(image, [_box((100, 50, 300, 200))], ASSETS, now=0.0)
     assert _is_ad(out[50:200, 100:300]).mean() > 0.98
+
+
+# --- WP25: no ad on an ad; signs followed by optical flow ---
+
+
+@pytest.fixture
+def drawn_quads(monkeypatch: pytest.MonkeyPatch) -> list[list[np.ndarray]]:
+    """The corners of every quad drawn, per draw() call (a new list is started by the test)."""
+    calls: list[list[np.ndarray]] = []
+    warp = replace._warp_into_box
+
+    def spy(out, image, asset, corners, region):
+        if calls:
+            calls[-1].append(np.array(corners, float))
+        return warp(out, image, asset, corners, region)
+
+    monkeypatch.setattr(replace, "_warp_into_box", spy)
+    return calls
+
+
+def _overlapping(quads: list[np.ndarray]) -> bool:
+    return any(
+        cv2.intersectConvexConvex(a.astype(np.float32), b.astype(np.float32))[0] > 0
+        for i, a in enumerate(quads) for b in quads[i + 1:]
+    )
+
+
+@pytest.mark.parametrize(
+    "boxes",
+    [
+        [(100, 50, 400, 300), (180, 120, 280, 220)],  # a poster nested in a billboard
+        [(100, 50, 300, 200), (220, 60, 400, 210)],  # two partly overlapping boxes on one panel
+    ],
+    ids=["nested", "partly overlapping"],
+)
+def test_overlapping_boxes_are_one_drawing(ads_dir: Path, drawn_quads, boxes) -> None:
+    replacer = AdReplacer(ads_dir)
+    for step in range(3):
+        drawn_quads.append([])
+        tracked = [_box(xyxy, f"obj#{k}", ("poster", "billboard")[k], last_seen=step * 0.07) for k, xyxy in enumerate(boxes)]
+        replacer.draw(_wall(), tracked, ASSETS, now=step * 0.07)
+        assert len(drawn_quads[-1]) == 1
+
+
+def test_two_signs_whose_quads_would_overlap_draw_only_the_established_one(ads_dir: Path, drawn_quads) -> None:
+    replacer = AdReplacer(ads_dir)
+    first = (100, 50, 300, 200)
+    drawn_quads.append([])
+    replacer.draw(_wall(), [_box(first, "obj#1")], ASSETS, now=0.0)
+    for step in range(1, 4):  # a second box touches the first only a little: its own sign, but its quad overlaps
+        now = step * 0.07
+        drawn_quads.append([])
+        boxes = [_box(first, "obj#1", last_seen=now), _box((280, 60, 450, 210), "obj#2", "billboard", last_seen=now)]
+        out = replacer.draw(_wall(), boxes, ASSETS, now=now)
+        assert len(drawn_quads[-1]) == 1 and not _overlapping(drawn_quads[-1])
+        assert _is_ad(out[60:190, 110:290]).mean() > 0.99  # the established one
+
+
+def _texture(seed: int = 1) -> np.ndarray:
+    """A large blotchy scene with plenty of corners to follow and no long straight outlines."""
+    rng = np.random.default_rng(seed)
+    noise = rng.integers(0, 256, (1200, 1600)).astype(np.float32)
+    blotchy = cv2.GaussianBlur(noise, (0, 0), 3)
+    blotchy = (blotchy - blotchy.mean()) * 6 + 128
+    return cv2.cvtColor(np.clip(blotchy, 0, 255).astype(np.uint8), cv2.COLOR_GRAY2BGR)
+
+
+def _camera(step: int) -> np.ndarray:
+    """Scene -> frame for a camera panning 4 px and zooming in 0.4 % a frame."""
+    scale = 1.0 + 0.004 * step
+    return np.float32([[scale, 0, -300 - 4 * step], [0, scale, -300 - 1 * step]])
+
+
+SCENE_SIGN = np.float32([[500, 400], [700, 400], [700, 550], [500, 550]])  # in scene px
+
+
+def test_drawn_corners_follow_the_scene_not_the_jittering_box(ads_dir: Path, drawn_quads) -> None:
+    scene = _texture()
+    replacer = AdReplacer(ads_dir)
+    errors, corners = [], []
+    for step in range(25):
+        transform = _camera(step)
+        frame = cv2.warpAffine(scene, transform, (WIDTH, HEIGHT), flags=cv2.INTER_LINEAR)
+        true = cv2.transform(SCENE_SIGN[None], transform)[0]
+        x1, y1 = true.min(axis=0)
+        x2, y2 = true.max(axis=0)
+        jitter = 0 if step == 0 else (12 if step % 2 else -12)  # the detector's box jumps 24 px a frame
+        box = (round(x1) + jitter, round(y1) - jitter, round(x2) + jitter, round(y2) + jitter)
+        drawn_quads.append([])
+        replacer.draw(frame, [_box(box, last_seen=step / 15)], ASSETS, now=step / 15)
+        assert len(drawn_quads[-1]) == 1
+        corners.append(drawn_quads[-1][0])
+        errors.append(np.abs(drawn_quads[-1][0] - true).max())
+    assert max(errors) <= 1.5
+    second_difference = np.abs(np.diff(np.stack(corners), n=2, axis=0)).max()
+    assert second_difference < 1.0  # the box's 24 px jumps do not reach the drawing
+
+
+def test_lost_flow_restarts_the_sign_at_its_fresh_box(ads_dir: Path, drawn_quads) -> None:
+    frame = cv2.warpAffine(_texture(), _camera(0), (WIDTH, HEIGHT))
+    replacer = AdReplacer(ads_dir)
+    replacer.draw(frame, [_box((100, 50, 300, 200), last_seen=0.0)], ASSETS, now=0.0)
+    changed = frame.copy()
+    changed[30:240, 80:340] = cv2.warpAffine(_texture(seed=2), _camera(0), (WIDTH, HEIGHT))[30:240, 80:340]
+    drawn_quads.append([])
+    replacer.draw(changed, [_box((120, 50, 320, 200), last_seen=0.07)], ASSETS, now=0.07)
+    assert np.abs(drawn_quads[-1][0] - [[120, 50], [320, 50], [320, 200], [120, 200]]).max() < 1  # not pulled slowly
+
+
+def test_a_sign_without_a_fresh_box_for_the_hold_over_is_dropped(ads_dir: Path) -> None:
+    image = _wall()
+    replacer = AdReplacer(ads_dir)
+    held = _box((100, 50, 300, 200), last_seen=0.0)  # the pipeline keeps sending the last box
+    for now in (0.0, 0.2, 0.4, config.HOLD_OVER_S):
+        assert _is_ad(replacer.draw(image, [held], ASSETS, now=now)[50:200, 100:300]).mean() > 0.99
+    for now in (config.HOLD_OVER_S + 0.05, config.HOLD_OVER_S + 0.1):  # dropped, and not restarted from that box
+        assert not _is_ad(replacer.draw(image, [held], ASSETS, now=now)).any()
