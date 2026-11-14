@@ -218,7 +218,10 @@ class Pipeline(threading.Thread):
 
         new_boxes = [box for box in [*tracked, *objects] if box.id not in self._seen_track_ids]
         self._seen_track_ids.update(box.id for box in new_boxes)
-        render.backfill(self._ring.recent(config.BACKFILL_FRAMES + 1)[:-1], new_boxes)
+        # Every frame still waiting, not only the last BACKFILL_FRAMES: when detection is slow more
+        # frames pile up, and none of them may go out without a box that has just appeared (leak review).
+        waiting = [earlier for earlier in self._ring.recent(len(self._ring)) if earlier.index < frame.index]
+        render.backfill(waiting, new_boxes)
         frame.faces_done = True
         self._watchdog.beat_faces(now)
 

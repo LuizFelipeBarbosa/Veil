@@ -9,6 +9,11 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+# Leak review, 15:40: Ultralytics posts usage statistics (frame counts, speeds, device; no frames)
+# to Google Analytics unless told it is offline. Nothing but mic audio to Deepgram may leave the
+# device, so this is set before anything imports ultralytics. The weights are already on disk.
+os.environ.setdefault("YOLO_OFFLINE", "1")
+
 PROFILE = os.environ.get("PRIVACY_CAM_PROFILE", "mac")
 if PROFILE not in ("mac", "pi"):
     raise ValueError(f"PRIVACY_CAM_PROFILE must be 'mac' or 'pi', got {PROFILE!r}")
@@ -31,7 +36,8 @@ FRAME_HEIGHT = 480
 # the frames it cannot reach, unseen, so the Pi's preview runs at whatever the scene allows.
 FPS = 15
 # Brief: 1 s. The lead chose a short delay at 13:25: about a third of a second, so a face swap on a
-# shown track can be visible for roughly 0.2 s before the identity check re-blurs it.
+# shown track is visible until the identity check re-blurs it. That check runs every ID_RECHECK_S
+# and allows retries, so the leak review puts the worst case near 0.9 s (it was 0 with the 1 s delay).
 DELAY_BUFFER_FRAMES = max(2, round(FPS / 3))  # 5 frames (0.33 s)
 BACKFILL_FRAMES = DELAY_BUFFER_FRAMES - 1  # frames before a new face that get blurred too
 

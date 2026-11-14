@@ -36,6 +36,8 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(threadName)s %(message)s")
     _load_env_file()
 
+    # At DEBUG the websockets library logs request headers, and ours carry the API key.
+    logging.getLogger("websockets").setLevel(logging.WARNING)
     policy = Policy()
     recorder = Recorder()
     pipeline = Pipeline(capture.open_source(args.source), policy, recorder)
