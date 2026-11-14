@@ -82,11 +82,13 @@ def build_settings(
     think_provider: str | None = None,
     temperature: float | None = config.DG_THINK_TEMPERATURE,
     speak_model: str | None = None,
+    reasoning_mode: str | None = None,
 ) -> dict[str, Any]:
     """The Voice Agent Settings message: Flux, hosted think model, Aura-2, the 5 tools, the prompt.
 
     The keyword arguments let scripts/voice_check.py try other hosted models;
-    temperature=None leaves it out, for models that only accept their default.
+    temperature=None leaves it out, for models that only accept their default;
+    reasoning_mode is for OpenAI reasoning models (gpt-5 family and later).
     """
     think_provider_settings: dict[str, Any] = {
         "type": think_provider or config.DG_THINK_PROVIDER,
@@ -94,6 +96,8 @@ def build_settings(
     }
     if temperature is not None:
         think_provider_settings["temperature"] = temperature
+    if reasoning_mode is not None:
+        think_provider_settings["reasoning_mode"] = reasoning_mode
     return {
         "type": "Settings",
         "mip_opt_out": True,  # privacy camera: don't hand bystanders' audio to model training
@@ -145,7 +149,8 @@ class VoiceAgent(threading.Thread):
         keyword_fallback_s: float | None = config.KEYWORD_FALLBACK_S,
         **settings_overrides: Any,
     ) -> None:
-        """settings_overrides go to build_settings (think_model, think_provider, temperature, speak_model).
+        """settings_overrides go to build_settings (think_model, think_provider, temperature,
+        speak_model, reasoning_mode).
 
         keyword_fallback_s=None turns the keyword fallback off (scripts/voice_check.py
         uses that to measure the model alone).
@@ -202,6 +207,12 @@ class VoiceAgent(threading.Thread):
         except RuntimeError:  # the loop is already closed: nothing left to do
             pass
 
+    def _say(self, role: str, text: str) -> None:
+        try:
+            self._on_transcript(role, text)
+        except Exception:  # noqa: BLE001 - a UI bug must not take the voice thread down
+            _log.exception("on_transcript failed")
+
     def _shutdown(self) -> None:
         self._close_mic()
         self._talking = False
@@ -219,7 +230,7 @@ class VoiceAgent(threading.Thread):
                 message = _short_error(error)
                 _log.warning("voice session ended: %s", message)
                 if message != last_error:  # don't flood the 3-line transcript while offline
-                    self._on_transcript("agent", message)
+                    self._say("agent", message)
                 last_error = message
                 failures += 1
             finally:
@@ -282,7 +293,7 @@ class VoiceAgent(threading.Thread):
                 raise
             except Exception as error:  # noqa: BLE001 - a bad message never touches the Policy
                 _log.warning("bad agent message: %s", error)
-                self._on_transcript("agent", "Voice: bad message from agent")
+                self._say("agent", "Voice: bad message from agent")
         raise ConnectionError("Voice: connection closed")
 
     def _dispatch(self, message: dict[str, Any]) -> None:
@@ -297,17 +308,17 @@ class VoiceAgent(threading.Thread):
             if self._speaker:
                 self._speaker.flush()  # barge-in: stop the old reply
         elif kind == "InjectionRefused":
-            self._on_transcript("agent", "Busy, try again.")
+            self._say("agent", "Busy, try again.")
         elif kind == "Error":
             raise _AgentError(f"Voice error: {message.get('description') or message.get('code')}")
         elif kind == "Warning":
             _log.warning("agent warning: %s %s", message.get("code"), message.get("description"))
             if "FAILED" in str(message.get("code", "")):  # e.g. THINK_REQUEST_FAILED: the turn is lost
-                self._on_transcript("agent", "Voice: the model failed, try again")
+                self._say("agent", "Voice: the model failed, try again")
 
     def _answer_function_calls(self, functions: list[dict[str, Any]]) -> None:
         for call in functions:
-            if not call.get("client_side", True):
+            if not isinstance(call, dict) or not call.get("client_side", True):
                 continue  # server-side: Deepgram answers it itself
             if self._turn:
                 self._turn.tool_called = True
@@ -322,9 +333,9 @@ class VoiceAgent(threading.Thread):
                 return  # the echo of our own InjectUserMessage, already shown
             if self._turn:
                 self._turn.user_text = content
-            self._on_transcript("you", content)
+            self._say("you", content)
         elif role == "assistant":
-            self._on_transcript("agent", content)
+            self._say("agent", content)
 
     # --- talk gate and typed commands (run on the loop) ---------------------------
 
@@ -333,7 +344,7 @@ class VoiceAgent(threading.Thread):
             return
         if pressed:
             if not self._ready.is_set():
-                self._on_transcript("agent", "Voice offline")
+                self._say("agent", "Voice offline")
                 return
             self._talking = True
             self._turn = None
@@ -343,10 +354,15 @@ class VoiceAgent(threading.Thread):
                 self._open_mic()
             except Exception as error:  # noqa: BLE001 - no mic: say so, stay closed
                 self._talking = False
-                self._on_transcript("agent", f"Mic error: {type(error).__name__}")
+                self._say("agent", f"Mic error: {type(error).__name__}")
             return
         self._talking = False
         self._close_mic()
+        # call_soon queues behind the mic callbacks already scheduled, so the last audio
+        # still goes out before ForceEndTurn.
+        self._loop.call_soon(self._end_turn)
+
+    def _end_turn(self) -> None:
         self._outbox.put_nowait(json.dumps({"type": "ForceEndTurn"}))
         self._turn = _Turn(ended_at=time.monotonic())
 
@@ -354,7 +370,7 @@ class VoiceAgent(threading.Thread):
         text = text.strip()
         if not text:
             return
-        self._on_transcript("you", text)
+        self._say("you", text)
         self._turn = _Turn(ended_at=time.monotonic(), user_text=text)
         if not self._ready.is_set():
             self._run_keyword_fallback()  # offline: class and panic commands still work
@@ -403,12 +419,12 @@ class VoiceAgent(threading.Thread):
         match = parse_keywords(turn.user_text) if turn else None
         if match is None:
             if not self._ready.is_set():
-                self._on_transcript("agent", "Voice offline")
+                self._say("agent", "Voice offline")
             return
         name, arguments = match
         result = self._handlers.handle(name, arguments)
         _log.info("keyword fallback %s %s -> %s", name, arguments, result)
-        self._on_transcript("agent", "Done." if result.get("ok") else "Couldn't do that.")
+        self._say("agent", "Done." if result.get("ok") else "Couldn't do that.")
 
 
 class _Speaker:

@@ -205,6 +205,7 @@ def main() -> int:
     parser.add_argument("--model", action="append", help="hosted think model; repeat to compare (default: config)")
     parser.add_argument("--provider", help=f"think provider (default: {config.DG_THINK_PROVIDER})")
     parser.add_argument("--no-temperature", action="store_true", help="leave temperature out of Settings")
+    parser.add_argument("--reasoning", help="reasoning_mode for OpenAI reasoning models: low, medium, high")
     args = parser.parse_args()
 
     results = []
@@ -212,6 +213,8 @@ def main() -> int:
         overrides: dict[str, Any] = {"think_model": model, "think_provider": args.provider}
         if args.no_temperature:
             overrides["temperature"] = None
+        if args.reasoning:
+            overrides["reasoning_mode"] = args.reasoning
         passed, _, _ = check_model(overrides)
         results.append((model or config.DG_THINK_MODEL, passed))
     if len(results) > 1:

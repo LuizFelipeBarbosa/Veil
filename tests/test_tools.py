@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import json
+import time
+
 import pytest
 
+import config
 from contracts import FACE, KNOWN_CLASSES, OBJECT_CLASSES, Policy, Scene
 from fakes import scenes
-from voice.dg_agent import build_settings
+from voice.dg_agent import VoiceAgent, build_settings
 from voice.tools import ToolHandlers, parse_keywords
 
 
@@ -259,3 +263,90 @@ def test_settings_shape() -> None:
     assert agent["speak"]["provider"]["model"].startswith("aura-2")
     for label in KNOWN_CLASSES:
         assert label in think["prompt"]
+
+
+# --- VoiceAgent without network, key or audio ---
+
+
+def _wait_for(condition, timeout: float = 2.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if condition():
+            return True
+        time.sleep(0.01)
+    return False
+
+
+def _offline_agent(handlers: ToolHandlers, lines: list) -> VoiceAgent:
+    return VoiceAgent(handlers, lambda role, text: lines.append((role, text)), use_audio=False)
+
+
+def _sent(agent: VoiceAgent) -> list:
+    sent = []
+    while not agent._outbox.empty():
+        sent.append(json.loads(agent._outbox.get_nowait()))
+    return sent
+
+
+def test_agent_without_key_reports_and_keyword_fallback_still_works(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(config.DEEPGRAM_API_KEY_ENV, raising=False)
+    handlers, policy = _handlers()
+    lines: list[tuple[str, str]] = []
+    agent = _offline_agent(handlers, lines)
+    agent.start()
+    try:
+        assert _wait_for(lambda: any("not set" in text for _, text in lines))
+        assert policy.to_dict() == Policy().to_dict()  # an error leaves the Policy untouched
+
+        agent.inject_text("unblur the guy")  # about a person: the parser won't touch it
+        agent.inject_text("blur everything")
+        assert _wait_for(lambda: policy.snapshot().panic)
+        assert policy.snapshot().track_overrides == {}
+        assert ("you", "blur everything") in lines
+        agent.set_talking(True)  # no-op without audio, must not raise
+        agent.set_talking(False)
+    finally:
+        agent.stop()
+        agent.join(timeout=3.0)
+    assert not agent.is_alive()
+
+
+def test_function_call_requests_get_function_call_responses() -> None:
+    handlers, policy = _handlers()
+    agent = _offline_agent(handlers, [])
+    agent._dispatch({
+        "type": "FunctionCallRequest",
+        "functions": [
+            {"id": "fc_1", "name": "get_scene", "arguments": "{}", "client_side": True},
+            {"id": "fc_2", "name": "set_track", "arguments": '{"track_id": "face#7", "action": "show"}', "client_side": True},
+            {"id": "fc_3", "name": "set_class_rule", "arguments": '{"label": "face", "action": "show"}', "client_side": True},
+            {"id": "fc_4", "name": "set_track", "arguments": "not json", "client_side": True},
+            {"id": "fc_5", "name": "server_thing", "arguments": "{}", "client_side": False},
+            "garbage",
+        ],
+    })
+    responses = _sent(agent)
+    assert [r["id"] for r in responses] == ["fc_1", "fc_2", "fc_3", "fc_4"]
+    assert all(r["type"] == "FunctionCallResponse" for r in responses)
+    results = [json.loads(r["content"]) for r in responses]
+    assert results[0]["owner"] == "face#2"
+    assert [r["ok"] for r in results] == [True, True, False, False]
+    assert policy.snapshot().track_overrides == {"face#7": "show"}
+    assert policy.snapshot().class_rules[FACE] == "blur"
+
+
+def test_conversation_text_reaches_on_transcript() -> None:
+    handlers, _ = _handlers()
+    lines: list[tuple[str, str]] = []
+    agent = _offline_agent(handlers, lines)
+    agent._dispatch({"type": "ConversationText", "role": "user", "content": "blur all faces"})
+    agent._dispatch({"type": "ConversationText", "role": "assistant", "content": "Faces blurred."})
+    assert lines == [("you", "blur all faces"), ("agent", "Faces blurred.")]
+
+
+def test_an_agent_error_message_ends_the_session_without_touching_policy() -> None:
+    handlers, policy = _handlers()
+    agent = _offline_agent(handlers, [])
+    with pytest.raises(RuntimeError):
+        agent._dispatch({"type": "Error", "description": "boom", "code": "X"})
+    assert policy.to_dict() == Policy().to_dict()
