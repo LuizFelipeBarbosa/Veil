@@ -30,6 +30,10 @@ _ROTATIONS_PER_CALL = 2
 _NOSE_COLUMNS = [8, 9]  # the third landmark; two passes' hits are one face when their noses agree
 # Or when the stronger hit's box already covers this share of the weaker one's box.
 _COVERED_SHARE = 0.7
+# A rotated-pass hit that is no upright hit's face needs this score (WP18). On intersection.mov such
+# hits on facades scored at most 0.65 (640x480) / 0.70 (320x240); on rotated crossing.mov faces,
+# 0.75 dropped recall at 320x240 to 0.90 at 45 and -135 degrees, 0.7 kept it at 0.91 or better.
+_ROTATED_ONLY_SCORE = 0.7
 # cv2.rotate codes for the exact quarter turns; any other angle goes through warpAffine.
 _QUARTER_TURNS = {90: cv2.ROTATE_90_COUNTERCLOCKWISE, 180: cv2.ROTATE_180, 270: cv2.ROTATE_90_CLOCKWISE}
 
@@ -59,10 +63,12 @@ class FaceDetector:
         score), its face_row landmarks in frame pixels so SFace can align it.
         """
         height, width = image.shape[:2]
-        rows = [self._detect_rows(image)]
+        upright = self._detect_rows(image)
+        rows = [upright]
         for angle in self._rotations_this_call():
             rotated, to_rotated = _rotate(image, angle)
-            rows.append(_map_rows(self._detect_rows(rotated), cv2.invertAffineTransform(to_rotated)))
+            mapped = _map_rows(self._detect_rows(rotated), cv2.invertAffineTransform(to_rotated))
+            rows.append(_without_phantoms(mapped, upright))
         merged = _merge_same_faces(rows)
         return [_to_detection(row, width, height) for row in merged]
 
@@ -131,6 +137,21 @@ def _map_rows(rows: np.ndarray, affine: np.ndarray) -> np.ndarray:
 
 def _apply(affine: np.ndarray, points: np.ndarray) -> np.ndarray:
     return points @ affine[:, :2].T + affine[:, 2]
+
+
+def _without_phantoms(rotated_rows: np.ndarray, upright_rows: np.ndarray) -> np.ndarray:
+    """The rotated pass's rows minus those that are likely scenery, not faces.
+
+    A row that is the same face as an upright row (the merge's own test, the rotated row as the
+    weaker one) is kept whatever its score. Any other row must score _ROTATED_ONLY_SCORE: facades
+    and windows turned 60 or 120 degrees look face-like to YuNet. That includes a big facade hit
+    around a small upright face: it merely overlaps the face, and the face keeps its own box.
+    """
+    keep = [
+        float(row[_SCORE_COLUMN]) >= _ROTATED_ONLY_SCORE or any(_same_face(row, upright) for upright in upright_rows)
+        for row in rotated_rows
+    ]
+    return rotated_rows[np.array(keep, dtype=bool)] if len(rotated_rows) else rotated_rows
 
 
 def _merge_same_faces(passes: list[np.ndarray]) -> list[np.ndarray]:

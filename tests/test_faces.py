@@ -12,6 +12,7 @@ import config
 from contracts import FACE, Detection
 from fakes.capture import FileSource
 from vision.faces import (
+    _ROTATED_ONLY_SCORE,
     _ROTATIONS,
     FaceDetector,
     _apply,
@@ -21,6 +22,7 @@ from vision.faces import (
     _rotate,
     _to_detection,
     _to_frame_pixels,
+    _without_phantoms,
 )
 
 DATA = Path(__file__).parent / "data"
@@ -304,6 +306,75 @@ def test_hits_from_different_passes_merge_to_the_highest_score_and_neighbours_st
     spanning = row(25, 0, 70, 0.95, nose=(58, 30))  # a stray wide hit between two faces, over 5/8 of this one
     merged = _merge_same_faces([np.stack([face]), np.stack([spanning])])
     assert [float(r[14]) for r in merged] == pytest.approx([0.95, 0.6])  # the real face is not swallowed
+
+
+# --- WP18: phantom faces from the rotated passes ---------------------------------
+
+
+def _row(x: float, y: float, size: float, score: float) -> np.ndarray:
+    """A square box with its nose landmark at the box centre."""
+    values = np.zeros(15, dtype=np.float32)
+    values[:4], values[8:10], values[14] = (x, y, size, size), (x + size / 2, y + size / 2), score
+    return values
+
+
+def test_a_rotated_only_hit_needs_a_high_score_unless_an_upright_hit_is_the_same_face() -> None:
+    upright = np.stack([_row(100, 100, 40, 0.42)])  # a weak face, upright pass
+    same_face = _row(95, 95, 50, 0.45)  # noses agree: the same face through a rotated pass, kept
+    facade = _row(300, 100, 160, 0.65)  # nothing upright there, below the floor: dropped
+    tilted_face = _row(500, 100, 80, 0.75)  # confident enough on its own: kept
+    kept = _without_phantoms(np.stack([same_face, facade, tilted_face]), upright)
+    assert [float(r[14]) for r in kept] == pytest.approx([0.45, 0.75])
+
+
+def test_a_big_weak_rotated_hit_around_a_small_upright_face_is_dropped() -> None:
+    """Measured on intersection.mov: 70-160 px facade hits enclosing a 13 px far-away face. The
+    small face keeps its own upright box; the big box would blur the building around it."""
+    small_face = _row(370, 317, 13, 0.78)
+    facade = _row(300, 270, 160, 0.44)  # covers the face, but its nose is elsewhere
+    facade[8:10] = (357, 300)
+    assert len(_without_phantoms(np.stack([facade]), np.stack([small_face]))) == 0
+
+
+def test_without_phantoms_handles_empty_passes() -> None:
+    nothing = np.empty((0, 15), dtype=np.float32)
+    assert _without_phantoms(nothing, nothing).shape == (0, 15)
+    lone = np.stack([_row(0, 0, 40, 0.5)])
+    assert len(_without_phantoms(lone, nothing)) == 0  # no upright pass hit at all: the floor applies
+    assert len(_without_phantoms(lone, lone)) == 1
+
+
+def intersection_clip() -> Path | None:
+    for candidate in (DATA / "intersection.mov", MAIN_CHECKOUT_DATA / "intersection.mov"):
+        if candidate.exists():
+            return candidate
+    return None
+
+
+# Every 4th frame of intersection.mov at 640x480 (81 frames), production round-robin: before WP18,
+# 12 boxes beyond the upright pass's, up to 454 px tall, on facades and windows; after, none. The
+# bounds leave room for a couple of jitter hits the size of the far-away faces (13-40 px), not a facade.
+INTERSECTION_EXTRA_BOXES_MAX = 2
+INTERSECTION_EXTRA_HEIGHT_MAX = 40
+
+
+def test_rotated_passes_add_almost_nothing_to_street_scenery() -> None:
+    clip = intersection_clip()
+    if clip is None:
+        pytest.skip("tests/data/intersection.mov not recorded yet")
+    upright = FaceDetector(input_size=(640, 480), rotations=())
+    detector = FaceDetector(input_size=(640, 480))  # the production round-robin schedule
+    source = FileSource(clip, loop=False)
+    extra_heights = []
+    index = 0
+    while (image := source.read()) is not None:
+        if index % 4 == 0:
+            upright_boxes = {d.xyxy for d in upright.detect(image)}
+            extra_heights += [d.xyxy[3] - d.xyxy[1] for d in detector.detect(image) if d.xyxy not in upright_boxes]
+        index += 1
+    source.release()
+    assert len(extra_heights) <= INTERSECTION_EXTRA_BOXES_MAX, extra_heights
+    assert max(extra_heights, default=0) <= INTERSECTION_EXTRA_HEIGHT_MAX, extra_heights
 
 
 def test_rotated_passes_round_robin_and_cover_every_angle() -> None:
