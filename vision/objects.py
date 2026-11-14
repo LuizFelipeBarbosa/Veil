@@ -24,14 +24,15 @@ log = logging.getLogger(__name__)
 # best-matching prompt, so the traffic-sign prompts below (label None) pull those signs
 # away from the street-name prompts and their boxes are dropped. "traffic sign" itself is
 # deliberately not a distractor: it outscores "street name sign" on the real blade signs.
+# WP19: the generic "sign with text" and "signboard" prompts are gone. On the clip their only
+# boxes at YOLOE_CONF were a square sign under the traffic lights that the model, asked alone,
+# calls "traffic sign" (0.76) rather than "sign with text" (0.38), and a no-parking sign.
 _PROMPT_LABELS: dict[str, str | None] = {
     "license plate": "license plate",
     "street name sign": "street sign",
     "street name plate": "street sign",
     "house number": "house number",
     "storefront sign": "storefront sign",
-    "sign with text": "storefront sign",
-    "signboard": "storefront sign",
     # Distractors: detected so they are not mistaken for the above, then ignored.
     "stop sign": None,
     "one way sign": None,
@@ -49,6 +50,17 @@ NCNN_IMGSZ = 320  # the NCNN export is made and run at this size (Brief: Pi, 320
 _DETECT_ONLY_CFG = "yoloe-26n.yaml"  # same weights without the mask branch: same boxes, faster
 _TEXT_ENCODER = "mobileclip2_b.ts"  # what YOLOE-26's get_text_pe loads, looked up in the working directory
 _IDLE_WAIT_S = 0.005
+
+# Street-name signs are kept from this confidence, the other labels from config.YOLOE_CONF.
+# Measured on the clip (every 4th frame, after suppression): NCNN at 320 scores the blades
+# 0.14-0.18 and the far blue sign 0.11-0.13, all wide but one edge-clipped box; 0.05 adds
+# boxes no prompt names well. PyTorch at 640 finds the same 8 wide blades at 0.2, 0.15 and 0.1.
+_STREET_SIGN_CONF = 0.1
+# A kept box is dropped when a more confident ignored-prompt box overlaps it this much
+# (IoU, or the share of the smaller box inside the other): "the same object". On the clip
+# at conf 0.05 this matched 13 NCNN pairs, every kept box below 0.1, none above 0.25.
+_SUPPRESS_IOU = 0.5
+_SUPPRESS_INSIDE = 0.8
 
 
 def load_prompted_model():
@@ -92,20 +104,49 @@ class ObjectDetector:
             self._imgsz = NCNN_IMGSZ
         else:
             raise ValueError(f"unknown YOLOE_RUNTIME {runtime!r}; use pytorch or ncnn")
-        self._conf = config.YOLOE_CONF
         # Warm-up: the first call compiles kernels and, for NCNN, reads the model's class names.
         self.detect(np.zeros((config.FRAME_HEIGHT, config.FRAME_WIDTH, 3), dtype=np.uint8))
 
     def detect(self, image: np.ndarray) -> list[Detection]:
-        result = self._model.predict(image, device=self._device, imgsz=self._imgsz, conf=self._conf, verbose=False)[0]
-        height, width = image.shape[:2]
+        """Contract-labelled boxes, minus any box an ignored prompt claims more confidently.
+
+        The model runs at the lowest per-label cut, so a confident ignored box (a stop sign)
+        can still suppress a weak kept box on the same object before the per-label cut.
+        Ultralytics' NMS is per class, so it never does this itself.
+        """
+        min_conf = min(config.YOLOE_CONF, _STREET_SIGN_CONF)
+        result = self._model.predict(image, device=self._device, imgsz=self._imgsz, conf=min_conf, verbose=False)[0]
         boxes = result.boxes
+        rows = [
+            (_label(result.names[int(cls)]), xyxy, float(conf))
+            for xyxy, conf, cls in zip(boxes.xyxy.tolist(), boxes.conf.tolist(), boxes.cls.tolist())
+        ]
+        ignored = [(xyxy, conf) for label, xyxy, conf in rows if label is None]
+        height, width = image.shape[:2]
         detections = []
-        for xyxy, conf, cls in zip(boxes.xyxy.tolist(), boxes.conf.tolist(), boxes.cls.tolist()):
-            label = _label(result.names[int(cls)])
-            if label is not None:  # None: a distractor prompt, never blurred
-                detections.append(Detection(label=label, xyxy=_clipped_box(xyxy, width, height), conf=float(conf)))
+        for label, xyxy, conf in rows:
+            if label is None or conf < _min_conf(label):  # None: a distractor prompt, never blurred
+                continue
+            if any(ignored_conf > conf and _same_object(xyxy, ignored_xyxy) for ignored_xyxy, ignored_conf in ignored):
+                continue
+            detections.append(Detection(label=label, xyxy=_clipped_box(xyxy, width, height), conf=conf))
         return detections
+
+
+def _min_conf(label: str) -> float:
+    return _STREET_SIGN_CONF if label == "street sign" else config.YOLOE_CONF
+
+
+def _same_object(a: list[float], b: list[float]) -> bool:
+    """IoU >= _SUPPRESS_IOU, or the smaller box at least _SUPPRESS_INSIDE inside the other."""
+    inter_w = min(a[2], b[2]) - max(a[0], b[0])
+    inter_h = min(a[3], b[3]) - max(a[1], b[1])
+    if inter_w <= 0 or inter_h <= 0:
+        return False
+    inter = inter_w * inter_h
+    area_a = (a[2] - a[0]) * (a[3] - a[1])
+    area_b = (b[2] - b[0]) * (b[3] - b[1])
+    return inter / (area_a + area_b - inter) >= _SUPPRESS_IOU or inter / min(area_a, area_b) >= _SUPPRESS_INSIDE
 
 
 def _label(prompt: str) -> str | None:

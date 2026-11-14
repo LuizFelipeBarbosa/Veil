@@ -16,7 +16,7 @@ import yaml
 import config
 from contracts import OBJECT_CLASSES, BufferedFrame, Detection
 from fakes.capture import FileSource
-from vision.objects import _PROMPT_LABELS, PROMPTS, ObjectDetector, ObjectsThread
+from vision.objects import _PROMPT_LABELS, _STREET_SIGN_CONF, PROMPTS, ObjectDetector, ObjectsThread
 
 # Lives only in the main checkout, never in git. Frames from it stay in memory.
 INTERSECTION_CLIP = Path("/Users/luiz/Developer/privacy-cam/tests/data/intersection.mov")
@@ -27,9 +27,16 @@ IGNORED_PROMPTS = {prompt for prompt, label in _PROMPT_LABELS.items() if label i
 # "street sign" on 19 frames, square stop/regulatory signs included. After, PyTorch at 640
 # finds 3 boxes, all wide blades high in the frame (w/h 2.7 to 3.3); NCNN at 320 finds none
 # at YOLOE_CONF (the same blades score 0.1 to 0.25 there).
-PYTORCH_MIN_SHARE_WITH_DETECTIONS = 0.2  # measured 9/33
-MAX_STREET_SIGN_BOXES = 8  # measured 3 PyTorch, 0 NCNN; was 29 PyTorch, 17 NCNN
+# WP19: street-name signs are kept from _STREET_SIGN_CONF, and ignored prompts win overlaps.
+# WP16 measured 9/33; WP19 6/33: the 3 lost frames held only the square traffic sign under
+# the lights that "sign with text" reported as a storefront sign.
+PYTORCH_MIN_SHARE_WITH_DETECTIONS = 0.15
+MAX_STREET_SIGN_BOXES = 8  # WP16: 3 PyTorch, 0 NCNN; was 29 PyTorch, 17 NCNN
 MIN_STREET_SIGN_ASPECT = 1.5  # a street-name blade is wide; stop and most regulatory signs are not
+WP16_PYTORCH_STREET_SIGN_FRAMES = 3  # of 33, at YOLOE_CONF, before WP19
+# WP19: the largest object box on the clip at the new cuts is 0.6% of the frame. The "big
+# areas of buildings" the lead saw came from the face detector, not from here.
+MAX_OBJECT_BOX_SHARE = 0.04
 
 
 # --- prompts ---------------------------------------------------------------
@@ -55,20 +62,58 @@ class _FakeBoxes:
 
 
 class _FakeModel:
-    """Returns one box per prompt, so every prompt's mapping is exercised."""
+    """Returns the given (xyxy, conf, prompt) rows at or above the asked conf, like ultralytics."""
 
-    def predict(self, image: np.ndarray, **_kwargs) -> list:
-        rows = [((10.0 + i, 20.0, 80.0 + i, 40.0), 0.5, i) for i in range(len(PROMPTS))]
+    def __init__(self, rows: list[tuple[tuple[float, float, float, float], float, str]]) -> None:
+        self._rows = rows
+
+    def predict(self, image: np.ndarray, conf: float, **_kwargs) -> list:
+        rows = [(xyxy, c, PROMPTS.index(prompt)) for xyxy, c, prompt in self._rows if c >= conf]
         result = type("Result", (), {"names": dict(enumerate(PROMPTS)), "boxes": _FakeBoxes(rows)})()
         return [result]
 
 
-def test_ignored_prompts_are_dropped_from_the_output() -> None:
+def _fake_detect(rows: list[tuple[tuple[float, float, float, float], float, str]]) -> list[Detection]:
     detector = object.__new__(ObjectDetector)  # skip loading a real model
-    detector._model, detector._device, detector._imgsz, detector._conf = _FakeModel(), "cpu", 640, 0.25
-    detections = detector.detect(np.zeros((config.FRAME_HEIGHT, config.FRAME_WIDTH, 3), dtype=np.uint8))
+    detector._model, detector._device, detector._imgsz = _FakeModel(rows), "cpu", 640
+    return detector.detect(np.zeros((config.FRAME_HEIGHT, config.FRAME_WIDTH, 3), dtype=np.uint8))
+
+
+def test_ignored_prompts_are_dropped_from_the_output() -> None:
+    # One box per prompt, side by side so none overlaps another.
+    rows = [((10.0 + 40 * i, 20.0, 40.0 + 40 * i, 40.0), 0.5, prompt) for i, prompt in enumerate(PROMPTS)]
+    detections = _fake_detect(rows)
     assert len(detections) == len(PROMPTS) - len(IGNORED_PROMPTS)
     assert {d.label for d in detections} == set(OBJECT_CLASSES)
+
+
+def test_a_more_confident_ignored_box_on_the_same_object_drops_the_kept_box() -> None:
+    sign = (100.0, 100.0, 200.0, 200.0)
+    # A 0.9 stop sign drops a 0.3 storefront box, and a 0.15 street-name box inside it.
+    assert _fake_detect([(sign, 0.9, "stop sign"), (sign, 0.3, "storefront sign")]) == []
+    assert _fake_detect([(sign, 0.9, "stop sign"), ((110.0, 140.0, 190.0, 165.0), 0.15, "street name sign")]) == []
+    # A less confident ignored box does not.
+    [kept] = _fake_detect([(sign, 0.2, "stop sign"), (sign, 0.3, "storefront sign")])
+    assert kept.label == "storefront sign" and kept.conf == pytest.approx(0.3)
+    # Nor does a confident one elsewhere, or one that only grazes the kept box.
+    [kept] = _fake_detect([((300.0, 300.0, 400.0, 400.0), 0.9, "stop sign"), (sign, 0.3, "storefront sign")])
+    assert kept.label == "storefront sign"
+    [kept] = _fake_detect([((170.0, 100.0, 270.0, 200.0), 0.9, "stop sign"), (sign, 0.3, "storefront sign")])
+    assert kept.label == "storefront sign"
+
+
+def test_street_signs_have_their_own_lower_confidence_cut() -> None:
+    assert _STREET_SIGN_CONF < config.YOLOE_CONF
+    between = (_STREET_SIGN_CONF + config.YOLOE_CONF) / 2
+    rows = [
+        ((10.0, 10.0, 70.0, 30.0), between, "street name sign"),
+        ((100.0, 10.0, 160.0, 30.0), between, "street name plate"),
+        ((200.0, 10.0, 260.0, 30.0), between, "license plate"),
+        ((300.0, 10.0, 360.0, 70.0), between, "storefront sign"),
+        ((400.0, 10.0, 460.0, 30.0), _STREET_SIGN_CONF * 0.9, "street name sign"),
+        ((500.0, 10.0, 560.0, 30.0), config.YOLOE_CONF, "license plate"),
+    ]
+    assert [d.label for d in _fake_detect(rows)] == ["street sign", "street sign", "license plate"]
 
 
 def test_the_ncnn_export_bakes_in_the_same_prompts() -> None:
@@ -96,27 +141,56 @@ def intersection_frames() -> list[np.ndarray]:
     return frames
 
 
-def _check_detections_on_clip(detector: ObjectDetector, frames: list[np.ndarray]) -> tuple[int, list[tuple]]:
-    """Checks every box; returns (frames with any detection, street sign boxes)."""
-    frames_with_detections, street_signs = 0, []
+def _check_detections_on_clip(detector: ObjectDetector, frames: list[np.ndarray]) -> tuple[int, int, list[tuple]]:
+    """Checks every box; returns (frames with any detection, frames with a street sign, street sign boxes)."""
+    frames_with_detections, frames_with_street_signs, street_signs = 0, 0, []
+    max_area = MAX_OBJECT_BOX_SHARE * config.FRAME_WIDTH * config.FRAME_HEIGHT
     for image in frames:
         detections = detector.detect(image)
-        frames_with_detections += bool(detections)
+        ignored = _ignored_boxes(detector, image)
         for detection in detections:
             assert detection.label in OBJECT_CLASSES
-            assert detection.label not in IGNORED_PROMPTS
             x1, y1, x2, y2 = detection.xyxy
             assert all(isinstance(v, int) for v in detection.xyxy)
             assert 0 <= x1 < x2 <= config.FRAME_WIDTH and 0 <= y1 < y2 <= config.FRAME_HEIGHT
-            assert config.YOLOE_CONF <= detection.conf <= 1.0
+            min_conf = _STREET_SIGN_CONF if detection.label == "street sign" else config.YOLOE_CONF
+            assert min_conf <= detection.conf <= 1.0
+            assert (x2 - x1) * (y2 - y1) <= max_area
+            assert not any(conf > detection.conf and _overlap(detection.xyxy, box) >= 0.5 for box, conf in ignored)
+        frames_with_detections += bool(detections)
         street_signs += [d.xyxy for d in detections if d.label == "street sign"]
-    return frames_with_detections, street_signs
+        frames_with_street_signs += any(d.label == "street sign" for d in detections)
+    return frames_with_detections, frames_with_street_signs, street_signs
+
+
+def _ignored_boxes(detector: ObjectDetector, image: np.ndarray) -> list[tuple[list[float], float]]:
+    """The ignored-prompt boxes the model sees on this image down to the lowest cut."""
+    result = detector._model.predict(
+        image, device=detector._device, imgsz=detector._imgsz, conf=_STREET_SIGN_CONF, verbose=False
+    )[0]
+    boxes = result.boxes
+    return [
+        (xyxy, conf)
+        for xyxy, conf, cls in zip(boxes.xyxy.tolist(), boxes.conf.tolist(), boxes.cls.tolist())
+        if result.names[int(cls)] in IGNORED_PROMPTS
+    ]
+
+
+def _overlap(a, b) -> float:
+    """The larger of IoU and the share of the smaller box inside the other."""
+    inter = max(0, min(a[2], b[2]) - max(a[0], b[0])) * max(0, min(a[3], b[3]) - max(a[1], b[1]))
+    area_a, area_b = (a[2] - a[0]) * (a[3] - a[1]), (b[2] - b[0]) * (b[3] - b[1])
+    return max(inter / (area_a + area_b - inter), inter / min(area_a, area_b))
 
 
 def _check_street_signs_are_wide_and_rare(street_signs: list[tuple]) -> None:
-    """Regression for WP16: no more square stop/regulatory signs reported as street signs."""
+    """Regression for WP16: no more square stop/regulatory signs reported as street signs.
+
+    A box cut by the left or right frame edge has lost its width, so its shape is not checked.
+    """
     assert len(street_signs) <= MAX_STREET_SIGN_BOXES
-    wide = [(x2 - x1) / (y2 - y1) >= MIN_STREET_SIGN_ASPECT for x1, y1, x2, y2 in street_signs]
+    whole = [(x1, y1, x2, y2) for x1, y1, x2, y2 in street_signs if 0 < x1 and x2 < config.FRAME_WIDTH]
+    wide = [(x2 - x1) / (y2 - y1) >= MIN_STREET_SIGN_ASPECT for x1, y1, x2, y2 in whole]
     assert sum(wide) >= 0.8 * len(wide)
 
 
@@ -124,23 +198,24 @@ def test_pytorch_detector_finds_street_name_signs_and_plates_on_the_clip(interse
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(config, "YOLOE_RUNTIME", "pytorch")
         detector = ObjectDetector()
-    frames_with_detections, street_signs = _check_detections_on_clip(detector, intersection_frames)
+    frames_with_detections, frames_with_street_signs, street_signs = _check_detections_on_clip(detector, intersection_frames)
     assert frames_with_detections >= PYTORCH_MIN_SHARE_WITH_DETECTIONS * len(intersection_frames)
-    assert street_signs, "the street-name blades on the clip are no longer found"
+    assert frames_with_street_signs > WP16_PYTORCH_STREET_SIGN_FRAMES
     _check_street_signs_are_wide_and_rare(street_signs)
 
 
 def test_ncnn_export_loads_and_reports_only_contract_labels_on_the_clip(intersection_frames: list[np.ndarray]) -> None:
     """Slow-tolerant: NCNN on the Mac CPU. Skipped until scripts/export_ncnn.py has run.
 
-    No minimum detection count: at 320 px nothing on this clip clears YOLOE_CONF (measured 0/33).
+    Street-name blades clear _STREET_SIGN_CONF here; at YOLOE_CONF nothing on this clip did (WP16: 0/33).
     """
     if not Path(config.YOLOE_NCNN_MODEL).is_dir():
         pytest.skip("no NCNN export; run scripts/export_ncnn.py")
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(config, "YOLOE_RUNTIME", "ncnn")
         detector = ObjectDetector()
-    _, street_signs = _check_detections_on_clip(detector, intersection_frames)
+    _, frames_with_street_signs, street_signs = _check_detections_on_clip(detector, intersection_frames)
+    assert frames_with_street_signs > 0
     _check_street_signs_are_wide_and_rare(street_signs)
 
 
