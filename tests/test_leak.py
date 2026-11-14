@@ -21,17 +21,19 @@ from vision.render import HoldOver, Watchdog, backfill, censor
 from vision.tracking import make_face_tracker
 
 LEAK_CHECK_SCORE = 0.3
-CLIP_CANDIDATES = (
-    Path(__file__).parent / "data" / "faces.mov",
-    Path("/Users/luiz/Developer/privacy-cam/tests/data/faces.mov"),  # the lead records into the main checkout
+CONFIDENT_FACE_SCORE = 0.6  # the Brief's own bar for "this is a face"
+MAX_WEAK_HIT_FRAME_SHARE = 0.20
+CLIP_DIRS = (
+    Path(__file__).parent / "data",
+    Path("/Users/luiz/Developer/privacy-cam/tests/data"),  # the lead records into the main checkout
 )
 
 
-def _faces_clip() -> Path:
-    for candidate in CLIP_CANDIDATES:
-        if candidate.exists():
-            return candidate
-    pytest.skip("tests/data/faces.mov not recorded yet")
+def _clip(name: str) -> Path:
+    for directory in CLIP_DIRS:
+        if (directory / name).exists():
+            return directory / name
+    pytest.skip(f"tests/data/{name} not recorded yet")
 
 
 def _always_blur(_box: TrackedBox, _policy: PolicySnapshot) -> str:
@@ -101,8 +103,9 @@ def _read_back(path: Path) -> list[np.ndarray]:
     return frames
 
 
-def test_no_face_survives_into_the_recording(tmp_path: Path) -> None:
-    clip = _faces_clip()
+@pytest.mark.parametrize("clip_name", ["faces.mov", "crossing.mov"])
+def test_no_face_survives_into_the_recording(clip_name: str, tmp_path: Path) -> None:
+    clip = _clip(clip_name)
     censored, raw_frames_with_faces = _censor_clip(clip)
     assert raw_frames_with_faces > 0, "the clip should contain faces"
     assert [frame.index for frame in censored] == list(range(len(censored)))
@@ -113,5 +116,15 @@ def test_no_face_survives_into_the_recording(tmp_path: Path) -> None:
     assert len(written) == len(censored)
 
     checker = FaceDetector(score=LEAK_CHECK_SCORE)
-    leaks = [i for i, image in enumerate(written) if checker.detect(image)]
-    assert leaks == [], f"faces found in recorded frames {leaks}"
+    hits = [(i, round(hit.conf, 2)) for i, image in enumerate(written) for hit in checker.detect(image)]
+
+    # Pass bar set by the lead on 2026-11-14: the 0.3 checker also fires on pixelated
+    # blobs and clothing, so zero hits is not reachable. No confident face may
+    # survive, and frames with any weak hit must stay under the limit.
+    confident = [(i, conf) for i, conf in hits if conf >= CONFIDENT_FACE_SCORE]
+    weak_frames = {i for i, _conf in hits}
+    print(f"leak check {clip_name}: hits in {len(weak_frames)} of {len(written)} frames, {len(confident)} confident")
+    assert confident == [], f"confident faces in the recording (frame, score): {confident}"
+    assert len(weak_frames) <= MAX_WEAK_HIT_FRAME_SHARE * len(written), (
+        f"weak hits in {len(weak_frames)} of {len(written)} frames"
+    )
