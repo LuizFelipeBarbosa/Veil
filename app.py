@@ -1,6 +1,6 @@
 """Entry point: starts the threads and runs the pygame UI on the main thread.
 
-    python app.py                      # live camera (after WP1)
+    python app.py                      # live camera
     python app.py --source clip.mp4    # play a clip through the same pipeline
 """
 
@@ -12,23 +12,47 @@ import logging
 import capture
 import ui
 from contracts import Policy
-from fakes.capture import FileSource
 from pipeline import Pipeline
+from recorder import Recorder
+
+log = logging.getLogger(__name__)
 
 
 def main() -> None:
     args = _parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(threadName)s %(message)s")
 
-    source = FileSource(args.source) if args.source else capture.open_source(None)
-    pipeline = Pipeline(source, Policy())
+    policy = Policy()
+    recorder = Recorder()
+    pipeline = Pipeline(capture.open_source(args.source), policy, recorder)
+
+    def toggle_recording() -> None:
+        if recorder.is_recording:
+            log.info("saved %s", recorder.stop())
+        else:
+            log.info("recording to %s", recorder.start())
+
+    def status() -> ui.UiStatus:
+        latest = pipeline.latest()
+        return ui.UiStatus(
+            recording=recorder.is_recording,
+            recording_s=recorder.elapsed_s,
+            fail_closed=latest is None or latest.fail_closed,
+            panic=policy.snapshot().panic,
+        )
+
     pipeline.start()
     try:
-        ui.run(get_frame=pipeline.latest, max_frames=args.frames)
+        ui.run(
+            get_frame=pipeline.latest,
+            get_status=status,
+            callbacks=ui.UiCallbacks(on_record_toggle=toggle_recording, on_panic=policy.set_panic),
+            max_frames=args.frames,
+        )
     finally:
         pipeline.stop()
         pipeline.join(timeout=2.0)
-        source.release()
+        recorder.stop()
 
 
 def _parse_args() -> argparse.Namespace:

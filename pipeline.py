@@ -1,24 +1,29 @@
 """The vision loop: raw frame in, CensoredFrame out. Orchestrator-owned (WP0, WP8).
 
-This is the one place raw frames turn into output, and it fails closed: until
-the detectors exist, and whenever censoring raises, the whole frame is pixelated.
-WP8 wires capture.RingBuffer, vision/* and the recorder in here.
+This is the one place raw frames turn into output, and it fails closed: while a
+detector is missing, and whenever censoring raises, the whole frame is pixelated.
+
+Per captured frame: detect on the newest frame (so late detections can be
+backfilled), then censor the oldest buffered frame, one second behind, with its
+own boxes, and hand it to the preview and the recorder.
 """
 
 from __future__ import annotations
 
 import logging
 import threading
-import time
 
 import cv2
 import numpy as np
 
 import config
-from capture import FrameSource
-from contracts import CensoredFrame, Policy
+from capture import CaptureThread, FrameSource, RingBuffer
+from contracts import BufferedFrame, CensoredFrame, Policy
+from recorder import Recorder
 
 log = logging.getLogger(__name__)
+
+_FRAME_WAIT_S = 0.1
 
 
 def fail_closed_frame(image: np.ndarray, index: int) -> CensoredFrame:
@@ -31,12 +36,14 @@ def fail_closed_frame(image: np.ndarray, index: int) -> CensoredFrame:
 
 
 class Pipeline(threading.Thread):
-    """Reads the source at config.FPS and publishes the latest censored frame."""
+    """Owns the capture thread and the delay buffer; publishes the latest censored frame."""
 
-    def __init__(self, source: FrameSource, policy: Policy) -> None:
+    def __init__(self, source: FrameSource, policy: Policy, recorder: Recorder | None = None) -> None:
         super().__init__(name="vision", daemon=True)
-        self._source = source
         self._policy = policy
+        self._recorder = recorder
+        self._ring = RingBuffer()
+        self._capture = CaptureThread(source, self._ring)
         self._stop_requested = threading.Event()
         self._latest_lock = threading.Lock()
         self._latest: CensoredFrame | None = None
@@ -47,29 +54,51 @@ class Pipeline(threading.Thread):
 
     def stop(self) -> None:
         self._stop_requested.set()
+        self._capture.stop()
 
     def run(self) -> None:
-        frame_period = 1.0 / config.FPS
-        index = 0
+        self._capture.start()
+        last_index = -1
         while not self._stop_requested.is_set():
-            started = time.monotonic()
-            image = self._source.read()
-            if image is None:
-                break
-            censored = self._censor_or_fail_closed(image, index)
-            with self._latest_lock:
-                self._latest = censored
-            index += 1
-            self._stop_requested.wait(max(0.0, frame_period - (time.monotonic() - started)))
+            newest = self._capture.wait_for_frame(last_index, _FRAME_WAIT_S)
+            if newest is None:
+                if not self._capture.is_alive():
+                    break
+                continue
+            last_index = newest.index
+            self._detect_or_leave_unchecked(newest)
 
-    def _censor_or_fail_closed(self, image: np.ndarray, index: int) -> CensoredFrame:
+            oldest = self._ring.pop_oldest()
+            if oldest is not None:
+                self._publish(self._censor_or_fail_closed(oldest))
+        self._capture.stop()
+
+    def _publish(self, censored: CensoredFrame) -> None:
+        with self._latest_lock:
+            self._latest = censored
+        if self._recorder is not None:
+            self._recorder.write(censored)
+
+    def _detect_or_leave_unchecked(self, frame: BufferedFrame) -> None:
+        """A frame whose detection fails keeps faces_done False, so it leaves the buffer pixelated."""
         try:
-            return self._censor(image, index)
+            self._detect(frame)
         except NotImplementedError:
-            return fail_closed_frame(image, index)
+            pass
         except Exception:
-            log.exception("censoring failed on frame %d; failing closed", index)
-            return fail_closed_frame(image, index)
+            log.exception("detection failed on frame %d; it will be pixelated whole", frame.index)
 
-    def _censor(self, image: np.ndarray, index: int) -> CensoredFrame:
-        raise NotImplementedError("WP8 wires faces, tracking, policy and render here")
+    def _censor_or_fail_closed(self, frame: BufferedFrame) -> CensoredFrame:
+        if not frame.faces_done:
+            return fail_closed_frame(frame.image, frame.index)
+        try:
+            return self._censor(frame)
+        except Exception:
+            log.exception("censoring failed on frame %d; failing closed", frame.index)
+            return fail_closed_frame(frame.image, frame.index)
+
+    def _detect(self, frame: BufferedFrame) -> None:
+        raise NotImplementedError("wired when WP2 merges: faces, tracking, hold-over, backfill, watchdog")
+
+    def _censor(self, frame: BufferedFrame) -> CensoredFrame:
+        raise NotImplementedError("wired when WP2 merges: render.censor with policy.decide")

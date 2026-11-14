@@ -6,6 +6,7 @@ import importlib
 import time
 from pathlib import Path
 
+import cv2
 import numpy as np
 import pytest
 
@@ -15,6 +16,7 @@ from contracts import KNOWN_CLASSES, Policy
 from fakes import scenes
 from fakes.capture import FileSource
 from pipeline import Pipeline, fail_closed_frame
+from recorder import Recorder
 
 SYNTHETIC_CLIP = Path(__file__).parent / "data" / "synthetic.mp4"
 
@@ -154,15 +156,27 @@ def test_fail_closed_frame_pixelates_everything() -> None:
     assert _is_pixelated(censored.image)
 
 
-def test_pipeline_fails_closed_while_detectors_are_stubs() -> None:
-    pipeline = Pipeline(FileSource(SYNTHETIC_CLIP), Policy())
+def test_pipeline_fails_closed_without_detection(tmp_path: Path) -> None:
+    """Frames whose face detection never finished come out pixelated, in the preview and on disk."""
+    recorder = Recorder(tmp_path)
+    recorder.start()
+    pipeline = Pipeline(FileSource(SYNTHETIC_CLIP), Policy(), recorder)
+    pipeline._detect = lambda frame: (_ for _ in ()).throw(RuntimeError("detector down"))
     pipeline.start()
-    deadline = time.monotonic() + 2.0
+    deadline = time.monotonic() + 5.0
     while pipeline.latest() is None and time.monotonic() < deadline:
         time.sleep(0.01)
     pipeline.stop()
     pipeline.join(timeout=2.0)
+    recording = recorder.stop()
 
     latest = pipeline.latest()
     assert latest is not None and latest.fail_closed
     assert _is_pixelated(latest.image)
+
+    video = cv2.VideoCapture(str(recording))
+    ok, first = video.read()
+    video.release()
+    assert ok
+    # MJPG is lossy, so compare block means against the frame instead of exact flatness
+    assert np.abs(first.astype(int) - fail_closed_frame(first, 0).image.astype(int)).mean() < 3
