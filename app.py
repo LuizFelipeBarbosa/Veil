@@ -85,6 +85,7 @@ def main() -> None:
                 on_talk=talk,
                 on_panic=policy.set_panic,
                 on_enroll_owner=pipeline.enroll_owner,
+                on_point=pipeline.toggle_at,
             ),
             max_frames=args.frames,
         )

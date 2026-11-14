@@ -43,11 +43,22 @@ def test_policy_starts_with_everything_blurred() -> None:
     }
 
 
-def test_showing_the_face_class_is_refused() -> None:
+def test_showing_the_face_class_is_an_explicit_choice_and_blurring_it_resets() -> None:
     policy = Policy()
-    with pytest.raises(ValueError):
-        policy.set_class_rule("face", "show")
-    assert policy.snapshot().class_rules["face"] == "blur"
+    assert policy.snapshot().class_rules["face"] == "blur"  # blurred until someone asks
+
+    policy.set_class_rule("face", "show")
+    policy.set_track_override("face#3", "blur")  # hide one person while everyone else is shown
+    shown = policy.snapshot()
+    assert shown.class_rules["face"] == "show"
+    assert shown.track_overrides == {"face#3": "blur"}
+    assert shown.face_reset_count == 0
+
+    policy.set_class_rule("face", "blur")
+    reset = policy.snapshot()
+    assert reset.class_rules["face"] == "blur"
+    assert reset.track_overrides == {}
+    assert reset.face_reset_count == 1
 
 
 def test_unknown_labels_and_actions_are_refused() -> None:
@@ -68,13 +79,14 @@ def test_blurring_faces_clears_face_overrides_only() -> None:
     assert policy.snapshot().track_overrides == {"obj#3": "show"}
 
 
-def test_show_all_unblurs_objects_and_the_given_people_but_not_the_face_class() -> None:
+def test_show_all_unblurs_every_class_keeps_blur_choices_and_clears_panic() -> None:
     policy = Policy()
     policy.set_panic(True)
-    policy.show_all(["face#2", "face#7"])
+    policy.set_track_override("face#7", "blur")
+    policy.show_all()
     shown = policy.snapshot()
-    assert shown.class_rules == {"face": "blur", **{label: "show" for label in contracts.OBJECT_CLASSES}}
-    assert shown.track_overrides == {"face#2": "show", "face#7": "show"}
+    assert shown.class_rules == {label: "show" for label in KNOWN_CLASSES}
+    assert shown.track_overrides == {"face#7": "blur"}
     assert shown.panic is False
 
 

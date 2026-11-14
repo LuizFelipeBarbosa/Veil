@@ -1,14 +1,19 @@
-"""pygame touch app (WP3). Runs on the main thread.
+"""pygame touch app (WP3, WP13). Runs on the main thread.
 
 Censored preview on the left, a column of thumb-sized buttons on the right
 (Record, hold-to-Talk, Panic, Owner), a status dot, the agent transcript and the
 recording timer. It only ever shows a CensoredFrame. Works with mouse, touch and
 the Mac keys; the layout scales to any landscape window from 480x320 up.
+
+Tapping a face or object on the preview reports the frame pixel under the tap
+(on_point). Outlines show what can be pointed at and whether it is blurred or
+shown; they are drawn on the screen only, never into the frame (Never-leaks rule 9).
 """
 
 from __future__ import annotations
 
 import logging
+import math
 import time
 from dataclasses import dataclass
 from typing import Callable, Hashable
@@ -17,7 +22,7 @@ import cv2
 import pygame
 
 import config
-from contracts import CensoredFrame
+from contracts import CensoredFrame, Highlight
 
 log = logging.getLogger(__name__)
 
@@ -30,7 +35,11 @@ _COLUMN_WIDTH_OF_HEIGHT = 0.45
 _GAP_OF_SHORT_SIDE = 0.02
 _BUTTON_FONT_OF_SHORT_SIDE = 0.075
 _TEXT_FONT_OF_SHORT_SIDE = 0.06
+_TAG_FONT_OF_SHORT_SIDE = 0.042
 _MIN_FONT_PX = 18
+_MIN_TAG_FONT_PX = 13
+_TAP_SLOP_OF_SHORT_SIDE = 0.03  # a pointer that moves further than this is a drag, not a tap
+_MIN_TAP_SLOP_PX = 8
 
 _BACKGROUND = (12, 12, 14)
 _PLACEHOLDER_BG = (28, 28, 32)
@@ -50,6 +59,13 @@ _STATUS_LIVE = (40, 200, 80)
 _STATUS_BLURRED = (230, 40, 40)
 _STRIP_RGBA = (0, 0, 0, 160)
 _BANNER_RGBA = (200, 0, 0, 220)
+# Highlight outlines: Okabe-Ito sky blue and orange stay apart under every common
+# colour-vision deficiency, and the tag text says the state in words as well.
+_HIGHLIGHT_BLURRED = (86, 180, 233)
+_HIGHLIGHT_SHOWN = (230, 159, 0)
+_TAG_RGBA = (0, 0, 0, 170)
+_OUTLINE_PX = 2
+_POINT_HINT = "tap a face or sign to blur or unblur"
 
 _BUTTON_NAMES = ("record", "talk", "panic", "owner")
 _MOUSE = "mouse"  # pointer id for the mouse; fingers use ("finger", touch_id, finger_id)
@@ -76,6 +92,7 @@ class UiCallbacks:
     on_talk: Callable[[bool], None] = lambda pressed: None  # True on press, False on release
     on_panic: Callable[[bool], None] = lambda on: None
     on_enroll_owner: Callable[[], None] = lambda: None
+    on_point: Callable[[int, int], None] = lambda x, y: None  # a tap on the preview, in FRAME pixels
 
 
 @dataclass(frozen=True)
@@ -84,16 +101,37 @@ class _Layout:
 
     size: tuple[int, int]
     preview_area: pygame.Rect  # left of the buttons; the frame is letterboxed inside
+    frame_rect: pygame.Rect  # where the frame is drawn inside preview_area
     buttons: dict[str, pygame.Rect]
     gap: int
+    tap_slop: int
     button_font: pygame.font.Font
     text_font: pygame.font.Font
+    tag_font: pygame.font.Font
 
-    def button_at(self, pos: tuple[int, int]) -> str | None:
+    def button_at(self, pos: tuple[float, float]) -> str | None:
         for name, rect in self.buttons.items():
-            if rect.collidepoint(pos):
+            if rect.collidepoint(int(pos[0]), int(pos[1])):
                 return name
         return None
+
+    def frame_point(self, pos: tuple[float, float]) -> tuple[int, int] | None:
+        """The frame pixel under a window position, or None outside the drawn frame."""
+        rect = self.frame_rect
+        if not (rect.left <= pos[0] < rect.right and rect.top <= pos[1] < rect.bottom):
+            return None
+        x = math.floor((pos[0] - rect.x) * config.FRAME_WIDTH / rect.width)
+        y = math.floor((pos[1] - rect.y) * config.FRAME_HEIGHT / rect.height)
+        return min(max(x, 0), config.FRAME_WIDTH - 1), min(max(y, 0), config.FRAME_HEIGHT - 1)
+
+    def window_rect(self, xyxy: tuple[int, int, int, int]) -> pygame.Rect:
+        """A box in frame pixels, scaled into the window and clipped to the drawn frame."""
+        rect = self.frame_rect
+        sx, sy = rect.width / config.FRAME_WIDTH, rect.height / config.FRAME_HEIGHT
+        x0, y0, x1, y1 = xyxy
+        left, top = rect.x + round(x0 * sx), rect.y + round(y0 * sy)
+        box = pygame.Rect(left, top, rect.x + round(x1 * sx) - left, rect.y + round(y1 * sy) - top)
+        return box.clip(rect)
 
 
 def _make_layout(size: tuple[int, int]) -> _Layout:
@@ -109,13 +147,17 @@ def _make_layout(size: tuple[int, int]) -> _Layout:
         name: pygame.Rect(column_x + gap, gap + i * (button_height + gap), column_width - 2 * gap, button_height)
         for i, name in enumerate(_BUTTON_NAMES)
     }
+    preview_area = pygame.Rect(0, 0, column_x, height)
     return _Layout(
         size=size,
-        preview_area=pygame.Rect(0, 0, column_x, height),
+        preview_area=preview_area,
+        frame_rect=_letterbox((config.FRAME_WIDTH, config.FRAME_HEIGHT), preview_area),
         buttons=buttons,
         gap=gap,
+        tap_slop=max(_MIN_TAP_SLOP_PX, round(short * _TAP_SLOP_OF_SHORT_SIDE)),
         button_font=pygame.font.Font(None, max(_MIN_FONT_PX, round(short * _BUTTON_FONT_OF_SHORT_SIDE))),
         text_font=pygame.font.Font(None, max(_MIN_FONT_PX, round(short * _TEXT_FONT_OF_SHORT_SIDE))),
+        tag_font=pygame.font.Font(None, max(_MIN_TAG_FONT_PX, round(short * _TAG_FONT_OF_SHORT_SIDE))),
     )
 
 
@@ -131,6 +173,9 @@ class _Controls:
     A pointer is the mouse, one finger or one key. Talk stays open while any
     pointer holds it and closes exactly once. Panic turns on at the press; clearing
     it needs a fresh press held for config.PANIC_HOLD_S.
+
+    A tap on the preview calls on_point once, at the release, and only when the
+    press also started on the frame and the pointer stayed within the tap slop.
     """
 
     def __init__(self, callbacks: UiCallbacks) -> None:
@@ -138,6 +183,24 @@ class _Controls:
         self._held: dict[Hashable, str] = {}  # pointer -> button it pressed
         self._talk_open = False
         self._panic_hold: tuple[Hashable, float] | None = None  # (pointer, pressed at)
+        self._taps: dict[Hashable, tuple[float, float]] = {}  # pointer -> window position it went down at
+
+    def start_tap(self, pointer: Hashable, pos: tuple[float, float]) -> None:
+        self._taps[pointer] = pos
+
+    def move(self, pointer: Hashable, pos: tuple[float, float], layout: _Layout) -> None:
+        """A pointer that wanders off its starting point is a drag; it will not tap."""
+        start = self._taps.get(pointer)
+        if start is not None and math.dist(start, pos) > layout.tap_slop:
+            del self._taps[pointer]
+
+    def end_tap(self, pointer: Hashable, pos: tuple[float, float], layout: _Layout) -> None:
+        self.move(pointer, pos, layout)
+        if self._taps.pop(pointer, None) is None:
+            return
+        point = layout.frame_point(pos)
+        if point is not None:
+            _safe_call(self._callbacks.on_point, *point)
 
     def is_held(self, button: str) -> bool:
         return button in self._held.values()
@@ -175,6 +238,7 @@ class _Controls:
             self._panic_hold = None  # released early: panic stays on
 
     def release_all(self) -> None:
+        self._taps.clear()  # a tap cut short by focus loss or quitting points at nothing
         for pointer in list(self._held):
             self.release(pointer)
 
@@ -248,7 +312,6 @@ def _handle_events(
     controls: _Controls, layout: _Layout, keys: dict[int, str], status: UiStatus, now: float
 ) -> bool:
     """Feed mouse, touch and key events to the controls; True when the app should quit."""
-    width, height = layout.size
     for event in pygame.event.get():
         if event.type == pygame.QUIT:
             return True
@@ -261,27 +324,50 @@ def _handle_events(
         elif event.type == pygame.KEYUP:
             controls.release(("key", event.key))
         elif event.type == pygame.MOUSEBUTTONDOWN and _is_real_left_click(event):
-            button = layout.button_at(event.pos)
-            if button is not None:
-                controls.press(_MOUSE, button, status, now)
+            _pointer_down(controls, layout, _MOUSE, event.pos, status, now)
+        elif event.type == pygame.MOUSEMOTION and not _is_from_touch(event):
+            controls.move(_MOUSE, event.pos, layout)
         elif event.type == pygame.MOUSEBUTTONUP and _is_real_left_click(event):
             controls.release(_MOUSE)
+            controls.end_tap(_MOUSE, event.pos, layout)
         elif event.type == pygame.FINGERDOWN:
-            button = layout.button_at((int(event.x * width), int(event.y * height)))
-            if button is not None:
-                controls.press(_finger(event), button, status, now)
+            _pointer_down(controls, layout, _finger(event), _finger_pos(event, layout), status, now)
+        elif event.type == pygame.FINGERMOTION:
+            controls.move(_finger(event), _finger_pos(event, layout), layout)
         elif event.type == pygame.FINGERUP:
             controls.release(_finger(event))
+            controls.end_tap(_finger(event), _finger_pos(event, layout), layout)
     return False
 
 
+def _pointer_down(
+    controls: _Controls, layout: _Layout, pointer: Hashable, pos: tuple[float, float], status: UiStatus, now: float
+) -> None:
+    """A press lands on a button, on the frame (a possible tap) or on nothing (the letterbox bars)."""
+    button = layout.button_at(pos)
+    if button is not None:
+        controls.press(pointer, button, status, now)
+    elif layout.frame_point(pos) is not None:
+        controls.start_tap(pointer, pos)
+
+
 def _is_real_left_click(event: pygame.event.Event) -> bool:
+    return event.button == 1 and not _is_from_touch(event)
+
+
+def _is_from_touch(event: pygame.event.Event) -> bool:
     """SDL also emits mouse events for touches; the FINGER events already handle those."""
-    return event.button == 1 and not getattr(event, "touch", False)
+    return bool(getattr(event, "touch", False))
 
 
 def _finger(event: pygame.event.Event) -> Hashable:
     return ("finger", event.touch_id, event.finger_id)
+
+
+def _finger_pos(event: pygame.event.Event, layout: _Layout) -> tuple[float, float]:
+    """Finger events come normalised to 0..1; kept fractional so the frame mapping stays exact."""
+    width, height = layout.size
+    return event.x * width, event.y * height
 
 
 # --- drawing ---------------------------------------------------------------
@@ -297,10 +383,16 @@ def _draw(
 ) -> None:
     screen.fill(_BACKGROUND)
     _draw_preview(screen, layout, frame)
+    highlights = () if frame is None or frame.fail_closed else frame.highlights
+    for highlight in highlights:
+        _draw_highlight(screen, layout, highlight)
     _draw_status(screen, layout, status)
     if status.panic:
         _draw_panic_banner(screen, layout)
-    _draw_transcript(screen, layout, status.transcript)
+    if status.transcript or not highlights:
+        _draw_transcript(screen, layout, status.transcript)
+    else:
+        _draw_point_hint(screen, layout)
     _draw_record_button(screen, layout, status, controls)
     _draw_talk_button(screen, layout, status, controls)
     _draw_panic_button(screen, layout, status, controls, now)
@@ -314,9 +406,32 @@ def _draw_preview(screen: pygame.Surface, layout: _Layout, frame: CensoredFrame 
         pygame.draw.rect(screen, _PLACEHOLDER_BG, area)
         _blit_centered(screen, layout.text_font.render("starting…", True, _DIM_TEXT), area.center)
         return
-    surface = _to_surface(frame)
-    target = _letterbox(surface.get_size(), area)
-    screen.blit(pygame.transform.scale(surface, target.size), target)  # nearest: keeps pixel blocks crisp
+    target = layout.frame_rect
+    screen.blit(pygame.transform.scale(_to_surface(frame), target.size), target)  # nearest: keeps pixel blocks crisp
+
+
+def _draw_highlight(screen: pygame.Surface, layout: _Layout, highlight: Highlight) -> None:
+    """A thin outline around one pointable track, with a small tag naming it and its state.
+
+    Drawn on the screen only: the frame's image is never touched (Never-leaks rule 9).
+    """
+    box = layout.window_rect(highlight.xyxy)
+    if box.width < 2 or box.height < 2:
+        return
+    color = _HIGHLIGHT_SHOWN if highlight.state == "show" else _HIGHLIGHT_BLURRED
+    pygame.draw.rect(screen, color, box, width=_OUTLINE_PX)
+
+    words = [highlight.label, "shown" if highlight.state == "show" else "blurred"]
+    if highlight.is_owner:
+        words.append("owner")
+    pad = max(2, layout.gap // 2)
+    text = _fit(layout.tag_font, " · ".join(words), max(box.width, layout.frame_rect.width // 3) - pad * 2, color)
+    tag = pygame.Rect(box.x, box.y - text.get_height() - pad * 2, text.get_width() + pad * 2, text.get_height() + pad * 2)
+    if tag.top < layout.frame_rect.top:
+        tag.top = box.top  # no room above: tuck it inside the box
+    tag.clamp_ip(layout.frame_rect)
+    _fill_translucent(screen, tag, _TAG_RGBA)
+    screen.blit(text, (tag.x + pad, tag.y + pad))
 
 
 def _letterbox(source_size: tuple[int, int], area: pygame.Rect) -> pygame.Rect:
@@ -368,6 +483,16 @@ def _draw_transcript(screen: pygame.Surface, layout: _Layout, transcript: tuple[
     max_width = strip.width - layout.gap * 2
     for i, line in enumerate(lines):
         screen.blit(_fit(font, line, max_width), (strip.x + layout.gap, strip.y + layout.gap + i * line_height))
+
+
+def _draw_point_hint(screen: pygame.Surface, layout: _Layout) -> None:
+    """One dim line where the transcript goes, until there is a transcript."""
+    area = layout.preview_area
+    text = _fit(layout.text_font, _POINT_HINT, area.width - layout.gap * 2, _DIM_TEXT)
+    strip = pygame.Rect(area.x, 0, area.width, text.get_height() + layout.gap * 2)
+    strip.bottom = area.bottom
+    _fill_translucent(screen, strip, _STRIP_RGBA)
+    screen.blit(text, (strip.x + layout.gap, strip.y + layout.gap))
 
 
 def _draw_record_button(screen: pygame.Surface, layout: _Layout, status: UiStatus, controls: _Controls) -> None:
@@ -427,13 +552,13 @@ def _draw_button(
         _blit_centered(screen, _fit(layout.button_font, label, rect.width - layout.gap * 2), rect.center)
 
 
-def _fit(font: pygame.font.Font, text: str, max_width: int) -> pygame.Surface:
+def _fit(font: pygame.font.Font, text: str, max_width: int, color: tuple[int, int, int] = _TEXT) -> pygame.Surface:
     """Render text, cutting it with an ellipsis when it is wider than max_width."""
     if font.size(text)[0] <= max_width:
-        return font.render(text, True, _TEXT)
+        return font.render(text, True, color)
     while text and font.size(text + "…")[0] > max_width:
         text = text[:-1]
-    return font.render(text.rstrip() + "…", True, _TEXT)
+    return font.render(text.rstrip() + "…", True, color)
 
 
 def _blit_centered(screen: pygame.Surface, surface: pygame.Surface, center: tuple[int, int]) -> None:
