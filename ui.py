@@ -8,7 +8,7 @@ the Mac keys; the layout scales to any landscape window from 480x320 up.
 Tapping a face or object on the preview reports the frame pixel under the tap
 (on_point). Outlines show what can be pointed at and whether it is blurred, shown
 or a replaced ad; they are drawn on the screen only, never into the frame (Never-leaks rule 9).
-The ad-cycling key (config.KEY_CYCLE_AD) has no on-screen button.
+The Ad button and config.KEY_CYCLE_AD step through the ad images, then off.
 """
 
 from __future__ import annotations
@@ -74,7 +74,7 @@ _TAG_RGBA = (0, 0, 0, 170)
 _OUTLINE_PX = 2
 _POINT_HINT = "tap a face or sign to blur or unblur"
 
-_BUTTON_NAMES = ("record", "talk", "panic", "owner")
+_BUTTON_NAMES = ("record", "talk", "panic", "owner", "ad")
 _MOUSE = "mouse"  # pointer id for the mouse; fingers use ("finger", touch_id, finger_id)
 
 
@@ -89,6 +89,7 @@ class UiStatus:
     talking: bool = False
     transcript: tuple[str, ...] = ()  # newest last, "you: ..." / "agent: ..."
     transcript_opacity: float = 1.0  # 1 fully visible, towards 0 as the chat fades out
+    ad: str = ""  # the ad image replacing ads right now, without its extension; empty when off
     owner_enrolled: bool = False
 
 
@@ -228,7 +229,7 @@ class _Controls:
             _safe_call(self._callbacks.on_record_toggle)
         elif button == "owner":
             _safe_call(self._callbacks.on_enroll_owner)
-        elif button == "ad":  # a key only, no button on screen
+        elif button == "ad":
             _safe_call(self._callbacks.on_cycle_ad)
         elif button == "talk" and not self._talk_open:
             self._talk_open = True  # set first: if on_talk raises, the release still closes the mic
@@ -409,6 +410,7 @@ def _draw(
     _draw_talk_button(screen, layout, status, controls)
     _draw_panic_button(screen, layout, status, controls, now)
     _draw_owner_button(screen, layout, status, controls)
+    _draw_ad_button(screen, layout, status, controls)
 
 
 def _draw_preview(screen: pygame.Surface, layout: _Layout, frame: CensoredFrame | None) -> None:
@@ -562,6 +564,15 @@ def _draw_owner_button(screen: pygame.Surface, layout: _Layout, status: UiStatus
         _draw_button(screen, layout, rect, "Owner set", _OWNER_SET_BG, controls.is_held("owner"))
     else:
         _draw_button(screen, layout, rect, "Set owner", _BUTTON_BG, controls.is_held("owner"))
+
+
+def _draw_ad_button(screen: pygame.Surface, layout: _Layout, status: UiStatus, controls: _Controls) -> None:
+    """Each press goes to the next ad image, then off. Lit, with the image's name, while ads are replaced."""
+    rect = layout.buttons["ad"]
+    if status.ad:
+        _draw_button(screen, layout, rect, f"Ad: {status.ad}", _OWNER_SET_BG, controls.is_held("ad"))
+    else:
+        _draw_button(screen, layout, rect, "Ads", _BUTTON_BG, controls.is_held("ad"))
 
 
 def _draw_button(

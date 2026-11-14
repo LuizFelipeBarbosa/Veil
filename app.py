@@ -101,6 +101,7 @@ def main() -> None:
             talking=talk_held.is_set(),
             transcript=tuple(transcript) if opacity > 0 else (),  # gone: the pointing hint comes back
             transcript_opacity=opacity,
+            ad=Path(next(iter(policy.snapshot().replacements.values()), "")).stem,
             owner_enrolled=pipeline.owner_enrolled,
         )
 

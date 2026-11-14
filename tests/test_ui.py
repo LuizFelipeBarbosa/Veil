@@ -672,3 +672,11 @@ def test_the_chat_fades_with_its_opacity() -> None:
 
     assert strip_brightness(0.0) == 0
     assert 0 < strip_brightness(0.5) < strip_brightness(1.0)
+
+
+@pytest.mark.parametrize("kind", ["mouse", "finger"])
+@pytest.mark.parametrize("size", POINT_SIZES)
+def test_the_ad_button_steps_through_the_ads(kind: str, size: tuple[int, int]) -> None:
+    app = _FakeApp()
+    app.run({1: _tap(kind, _button_rects(size)["ad"].center, size)}, size=size, on_cycle_ad=lambda: app.calls.append(("ad",)))
+    assert app.calls == [("ad",)]
