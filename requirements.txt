@@ -1,0 +1,8 @@
+ultralytics
+opencv-python
+trackers
+pygame
+sounddevice
+deepgram-sdk
+pytest
+# Pi only: pip install ncnn ; sudo apt install libportaudio2
