@@ -82,8 +82,3 @@ def test_unconfirmed_and_dropped_detections_get_fresh_provisional_ids() -> None:
         assert [b.xyxy[0] for b in boxes] == [0, 200, 400]
         ids += [b.id for b in boxes]
     assert len(ids) == len(set(ids)) == 9
-
-
-def test_object_tracker_belongs_to_wp5() -> None:
-    with pytest.raises(NotImplementedError):
-        make_object_tracker()

@@ -26,7 +26,8 @@ from vision import policy as policy_rules
 from vision import render
 from vision.faces import FaceDetector
 from vision.identity import OwnerIdentity
-from vision.tracking import make_face_tracker
+from vision.objects import ObjectDetector, ObjectsThread
+from vision.tracking import make_face_tracker, make_object_tracker
 
 log = logging.getLogger(__name__)
 
@@ -60,7 +61,13 @@ class Pipeline(threading.Thread):
         self._face_tracker = make_face_tracker()
         self._identity = OwnerIdentity()
         self._hold_over = render.HoldOver()
-        self._watchdog = render.Watchdog(watch_objects=False)  # WP5 turns the object watchdog on
+        self._watchdog = render.Watchdog()
+
+        # Built before any thread starts: loading YOLOE changes the working directory for a moment.
+        self._objects = ObjectsThread(ObjectDetector(), self._ring.newest)
+        self._object_tracker = make_object_tracker()
+        self._object_hold_over = render.HoldOver()
+        self._last_object_result_index = -1
         self._seen_track_ids: set[str] = set()
         self._owner_id: str | None = None
         self._owner_lost_at: dict[str, int] = {}  # track id -> frame index where it stopped being the owner
@@ -86,9 +93,11 @@ class Pipeline(threading.Thread):
     def stop(self) -> None:
         self._stop_requested.set()
         self._capture.stop()
+        self._objects.stop()
 
     def run(self) -> None:
         self._capture.start()
+        self._objects.start()
         last_index = -1
         while not self._stop_requested.is_set():
             newest = self._capture.wait_for_frame(last_index, _FRAME_WAIT_S)
@@ -103,6 +112,7 @@ class Pipeline(threading.Thread):
             if oldest is not None:
                 self._publish(self._censor_or_fail_closed(oldest))
         self._capture.stop()
+        self._objects.stop()
 
     def _publish(self, censored: CensoredFrame) -> None:
         with self._latest_lock:
@@ -136,17 +146,37 @@ class Pipeline(threading.Thread):
         self._identity.update(frame.image, tracked, self._policy, now)
         self._follow_owner(tracked, frame.index)
 
+        objects = self._new_object_boxes()
         frame.boxes.extend(self._hold_over.apply(tracked, now, frame_index=frame.index))
-        new_boxes = [box for box in tracked if box.id not in self._seen_track_ids]
+        frame.boxes.extend(self._object_hold_over.apply(objects, now, frame_index=frame.index))
+
+        new_boxes = [box for box in [*tracked, *objects] if box.id not in self._seen_track_ids]
         self._seen_track_ids.update(box.id for box in new_boxes)
         render.backfill(self._ring.recent(config.BACKFILL_FRAMES + 1)[:-1], new_boxes)
         frame.faces_done = True
         self._watchdog.beat_faces(now)
 
-        confident = [box for box in tracked if box.conf >= config.SCENE_MIN_CONF]
-        scene = policy_rules.build_scene(confident, self._policy.snapshot(), config.FRAME_WIDTH, config.FRAME_HEIGHT)
+        confident_faces = [box for box in tracked if box.conf >= config.SCENE_MIN_CONF]
+        visible = [*confident_faces, *(box for box in frame.boxes if box.label != FACE)]
+        scene = policy_rules.build_scene(visible, self._policy.snapshot(), config.FRAME_WIDTH, config.FRAME_HEIGHT)
         with self._latest_lock:
             self._scene = scene
+
+    def _new_object_boxes(self) -> list[TrackedBox]:
+        """Tracked boxes from a YOLOE result not handled yet, else nothing (hold-over bridges the gap).
+
+        YOLOE runs on its own thread on whichever frame was newest, so its boxes land
+        a few frames late; backfill and padding cover that.
+        """
+        result = self._objects.latest()
+        if result is None:
+            return []
+        frame_index, finished_at, detections = result
+        if frame_index == self._last_object_result_index:
+            return []
+        self._last_object_result_index = frame_index
+        self._watchdog.beat_objects(finished_at)
+        return self._object_tracker.update(detections, frame_index, finished_at)
 
     def _follow_owner(self, tracked: list[TrackedBox], frame_index: int) -> None:
         """Remember when a track that is still in frame stops being the owner (a failed ID re-check)."""
