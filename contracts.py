@@ -8,7 +8,7 @@ from __future__ import annotations
 import threading
 from dataclasses import asdict, dataclass, field
 from types import MappingProxyType
-from typing import Any, Iterable, Literal, Mapping
+from typing import Any, Literal, Mapping
 
 import numpy as np
 
@@ -106,14 +106,20 @@ class PolicySnapshot:
     class_rules: Mapping[str, Action]
     track_overrides: Mapping[str, Action]
     panic: bool
+    # Goes up each time the face class is set to "blur". Whoever remembers
+    # unblurred people (vision/identity.py) must forget them all when it changes.
+    face_reset_count: int = 0
 
 
 class Policy:
     """The only state the agent and the buttons can change. Thread-safe.
 
-    The hard limits live here so no caller can skip them: faces can never be
-    shown as a class, unknown labels are refused, and blurring faces clears
-    every face override.
+    Everything starts blurred. The limits live here so no caller can skip them:
+    unknown labels and actions are refused, and blurring the face class clears
+    every face override and makes every remembered person forgotten.
+
+    Changed by the lead on 2026-11-14 (was refused in the Brief): the face class
+    may be set to "show" on an explicit request to keep everyone unblurred.
     """
 
     def __init__(self) -> None:
@@ -121,6 +127,7 @@ class Policy:
         self._class_rules: dict[str, Action] = {label: "blur" for label in KNOWN_CLASSES}
         self._track_overrides: dict[str, Action] = {}
         self._panic = False
+        self._face_reset_count = 0
 
     def snapshot(self) -> PolicySnapshot:
         with self._lock:
@@ -128,6 +135,7 @@ class Policy:
                 class_rules=MappingProxyType(dict(self._class_rules)),
                 track_overrides=MappingProxyType(dict(self._track_overrides)),
                 panic=self._panic,
+                face_reset_count=self._face_reset_count,
             )
 
     def to_dict(self) -> dict[str, Any]:
@@ -139,16 +147,19 @@ class Policy:
         }
 
     def set_class_rule(self, label: str, action: Action) -> None:
-        """Raises ValueError for an unknown label or action, or for showing all faces."""
+        """Raises ValueError for an unknown label or action.
+
+        ("face", "show") keeps everyone unblurred, including people who arrive later,
+        until ("face", "blur"), which also clears every per-person choice.
+        """
         _require_action(action)
         if label not in KNOWN_CLASSES:
             raise ValueError(f"unknown label {label!r}; known: {', '.join(KNOWN_CLASSES)}")
-        if label == FACE and action == "show":
-            raise ValueError("faces can only be shown one track at a time")
         with self._lock:
             self._class_rules[label] = action
-            if label == FACE:
+            if label == FACE and action == "blur":
                 self._clear_overrides(FACE_ID_PREFIX)
+                self._face_reset_count += 1
 
     def set_track_override(self, track_id: str, action: Action) -> None:
         """The caller checks that track_id is in the live scene."""
@@ -164,17 +175,14 @@ class Policy:
         with self._lock:
             self._panic = bool(on)
 
-    def show_all(self, face_track_ids: Iterable[str]) -> None:
-        """Unblur everything in view: every object class, and the given people one by one.
+    def show_all(self) -> None:
+        """Unblur everything and keep it unblurred: every class, faces included. Turns panic off.
 
-        The face class itself stays "blur", so anyone who arrives later starts blurred.
-        Also turns panic off.
+        Per-track "blur" choices stay, so select things can still be hidden.
         """
         with self._lock:
-            for label in OBJECT_CLASSES:
+            for label in KNOWN_CLASSES:
                 self._class_rules[label] = "show"
-            for track_id in face_track_ids:
-                self._track_overrides[track_id] = "show"
             self._panic = False
 
     def _clear_overrides(self, id_prefix: str) -> None:
@@ -242,8 +250,9 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     },
     {
         "name": "set_class_rule",
-        "description": "Blur or show every object of one known class. Showing the face class is "
-        "refused; blurring it also clears every per-person override.",
+        "description": "Blur or show a whole class. Showing the face class unblurs everyone and "
+        "keeps people who arrive later unblurred too; blurring it blurs everyone again and forgets "
+        "every per-person choice.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -278,9 +287,9 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     },
     {
         "name": "show_all",
-        "description": "Unblur everything in view right now: every known object class and every "
-        "person currently in the scene. People who arrive later still start blurred. Also turns "
-        "panic off. Only for an explicit request to unblur or show everything.",
+        "description": "Unblur everything and keep it unblurred: every object class and every "
+        "person, including people who arrive later. Also turns panic off. Only for an explicit "
+        "request to unblur or show everything.",
         "parameters": _NO_ARGUMENTS,
     },
 ]
