@@ -9,9 +9,10 @@ import supervision as sv
 from trackers import ByteTrackTracker
 
 import config
-from contracts import FACE_ID_PREFIX, Detection, TrackedBox
+from contracts import FACE_ID_PREFIX, OBJECT_ID_PREFIX, Detection, TrackedBox
 
 _UNCONFIRMED = -1
+_OBJECT_UPDATES_PER_S = 8.0  # YOLOE finishes a frame 3-15 times a second, depending on the device
 
 
 class Tracker:
@@ -94,4 +95,11 @@ def make_face_tracker() -> Tracker:
 
 
 def make_object_tracker() -> Tracker:
-    raise NotImplementedError("WP5")
+    """Fed once per finished YOLOE result, about 3-15 per second, so it assumes 8 updates a second
+    and keeps a lost object for the object watchdog's 1.5 s before its ID is retired."""
+    return Tracker(
+        OBJECT_ID_PREFIX,
+        min_conf=config.YOLOE_CONF,
+        frame_rate=_OBJECT_UPDATES_PER_S,
+        lost_track_s=config.OBJECT_WATCHDOG_S,
+    )
