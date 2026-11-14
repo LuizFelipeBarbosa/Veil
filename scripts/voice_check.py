@@ -1,4 +1,4 @@
-"""WP7/WP14 live check: typed commands through Deepgram's Voice Agent against fixture scenes.
+"""WP7/WP14/WP21 live check: typed commands through Deepgram's Voice Agent against fixture scenes.
 
     set -a; source .env; set +a; python scripts/voice_check.py [--model gpt-4.1-mini ...]
 
@@ -21,14 +21,16 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import config  # noqa: E402
-from contracts import KNOWN_CLASSES, Policy, Scene, SceneTrack  # noqa: E402
+from contracts import AD_CLASSES, DEFAULT_CLASS_RULES, KNOWN_CLASSES, Policy, Scene, SceneTrack  # noqa: E402
 from fakes import scenes  # noqa: E402
 from voice.dg_agent import VoiceAgent  # noqa: E402
 from voice.tools import ToolHandlers  # noqa: E402
 
 GET_SCENE = ("get_scene", {})
-STATE_TOOLS = {"set_class_rule", "set_track", "blur_all", "clear_panic", "show_all"}
+STATE_TOOLS = {"set_class_rule", "set_track", "set_replacement", "blur_all", "clear_panic", "show_all"}
 CAN_HIDE_WORDS = ("face", "plate", "street", "house", "storefront")
+# Every case runs with these on the "device", so the old commands are checked with the ad prompt too.
+FAKE_AD_ASSETS = ("summer_sale.png", "coffee.jpg", "concert_tickets.png")
 
 
 @dataclass(frozen=True)
@@ -52,12 +54,18 @@ def _track(track_id: str, action: str) -> tuple[str, dict[str, Any]]:
     return ("set_track", {"track_id": track_id, "action": action})
 
 
+def _replacement(label: str, asset: str) -> tuple[str, dict[str, Any]]:
+    return ("set_replacement", {"label": label, "asset": asset})
+
+
 def _sighting(track_id: str, label: str, side: str, distance: str, state: str) -> SceneTrack:
     return SceneTrack(id=track_id, label=label, side=side, distance=distance, state=state)  # type: ignore[arg-type]
 
 
-def _scene(owner: str | None, *tracks: SceneTrack, shown: tuple[str, ...] = ()) -> Scene:
-    rules = {label: "show" if label in shown else "blur" for label in KNOWN_CLASSES}
+def _scene(owner: str | None, *tracks: SceneTrack, shown: tuple[str, ...] = (), replaced: tuple[str, ...] = ()) -> Scene:
+    """Ads keep their default (shown) unless replaced; every other class is blurred unless shown."""
+    rules = {label: "show" if label in shown else DEFAULT_CLASS_RULES[label] for label in KNOWN_CLASSES}
+    rules.update({label: "replace" for label in replaced})
     return Scene(owner=owner, tracks=tracks, class_rules=rules, panic=False)  # type: ignore[arg-type]
 
 
@@ -125,12 +133,27 @@ SCENES: dict[str, Scene] = {
         _sighting("face#8", "face", "owner_left", "near", "blur"),
         _sighting("obj#3", "license plate", "right", "far", "blur"),
     ),
+    # WP21: a billboard and a poster in view, shown as ads are by default
+    "ads_in_view": _scene(
+        "face#2", _OWNER,
+        _sighting("obj#4", "billboard", "owner_left", "far", "show"),
+        _sighting("obj#5", "poster", "owner_right", "near", "show"),
+    ),
+    # the same, with every ad class replaced by an image
+    "ads_replaced": _scene(
+        "face#2", _OWNER,
+        _sighting("obj#4", "billboard", "owner_left", "far", "replace"),
+        _sighting("obj#5", "poster", "owner_right", "near", "replace"),
+        replaced=AD_CLASSES,
+    ),
 }
 
 _RESET = (("clear_panic", {}), *(_rule(label, "blur") for label in KNOWN_CLASSES))
 _SHOW_FACES = (_rule("face", "show"),)
 # Showing the face class keeps new people unblurred: no follow-up question, no "they stay blurred".
 _STILL_BLURRED = ("still be blurred", "stay blurred", "will be blurred", "remain blurred", "?")
+_REPLACE_ADS = tuple(_replacement(label, FAKE_AD_ASSETS[0]) for label in AD_CLASSES)
+_SHOW_ADS = tuple(_rule(label, "show") for label in AD_CLASSES)
 
 CASES = [
     Case("owner_and_friend_left", "Unblur the person on my left, she's with me.", (GET_SCENE, _track("face#7", "show"))),
@@ -188,6 +211,13 @@ CASES = [
         (GET_SCENE, _track("face#7", "show"), GET_SCENE, _track("face#8", "show")),
         then_scene="friend_renumbered",
     ),
+    # --- WP21: replacing ads with an image on the device ---
+    Case("ads_in_view", "Replace the ads.", (), any_order=_REPLACE_ADS),
+    Case("ads_in_view", "Put the coffee ad on the billboards.", (_replacement("billboard", "coffee.jpg"),)),
+    Case("ads_in_view", "Swap the posters for the concert tickets ad.", (_replacement("poster", "concert_tickets.png"),)),
+    Case("ads_replaced", "Stop replacing the ads.", (), any_order=_SHOW_ADS),
+    Case("ads_replaced", "Show the real ads.", (), any_order=_SHOW_ADS),
+    Case("ads_in_view", "Blur the posters.", (_rule("poster", "blur"),)),
 ]
 
 
@@ -211,7 +241,7 @@ class _RecordingHandlers(ToolHandlers):
     """Records every call; switches to `then_scene` once the agent has read the first scene."""
 
     def __init__(self, policy: Policy, scene: Scene, then_scene: Scene | None, run: _Run) -> None:
-        super().__init__(policy, lambda: self._scene)
+        super().__init__(policy, lambda: self._scene, ad_assets=FAKE_AD_ASSETS)
         self._scene = scene
         self._then_scene = then_scene
         self._run = run

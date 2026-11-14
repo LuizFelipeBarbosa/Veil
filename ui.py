@@ -6,8 +6,9 @@ recording timer. It only ever shows a CensoredFrame. Works with mouse, touch and
 the Mac keys; the layout scales to any landscape window from 480x320 up.
 
 Tapping a face or object on the preview reports the frame pixel under the tap
-(on_point). Outlines show what can be pointed at and whether it is blurred or
-shown; they are drawn on the screen only, never into the frame (Never-leaks rule 9).
+(on_point). Outlines show what can be pointed at and whether it is blurred, shown
+or a replaced ad; they are drawn on the screen only, never into the frame (Never-leaks rule 9).
+The ad-cycling key (config.KEY_CYCLE_AD) has no on-screen button.
 """
 
 from __future__ import annotations
@@ -63,6 +64,12 @@ _BANNER_RGBA = (200, 0, 0, 220)
 # colour-vision deficiency, and the tag text says the state in words as well.
 _HIGHLIGHT_BLURRED = (86, 180, 233)
 _HIGHLIGHT_SHOWN = (230, 159, 0)
+_HIGHLIGHT_REPLACED = (204, 121, 167)  # Okabe-Ito reddish purple: an ad with an image drawn over it
+_STATE_STYLES = {  # Highlight.state -> outline colour, tag word
+    "blur": (_HIGHLIGHT_BLURRED, "blurred"),
+    "show": (_HIGHLIGHT_SHOWN, "shown"),
+    "replace": (_HIGHLIGHT_REPLACED, "ad"),
+}
 _TAG_RGBA = (0, 0, 0, 170)
 _OUTLINE_PX = 2
 _POINT_HINT = "tap a face or sign to blur or unblur"
@@ -93,6 +100,7 @@ class UiCallbacks:
     on_panic: Callable[[bool], None] = lambda on: None
     on_enroll_owner: Callable[[], None] = lambda: None
     on_point: Callable[[int, int], None] = lambda x, y: None  # a tap on the preview, in FRAME pixels
+    on_cycle_ad: Callable[[], None] = lambda: None  # config.KEY_CYCLE_AD: the next ad image, or off
 
 
 @dataclass(frozen=True)
@@ -219,6 +227,8 @@ class _Controls:
             _safe_call(self._callbacks.on_record_toggle)
         elif button == "owner":
             _safe_call(self._callbacks.on_enroll_owner)
+        elif button == "ad":  # a key only, no button on screen
+            _safe_call(self._callbacks.on_cycle_ad)
         elif button == "talk" and not self._talk_open:
             self._talk_open = True  # set first: if on_talk raises, the release still closes the mic
             _safe_call(self._callbacks.on_talk, True)
@@ -286,6 +296,7 @@ def run(
         pygame.key.key_code(config.KEY_TALK): "talk",
         pygame.key.key_code(config.KEY_PANIC): "panic",
         pygame.key.key_code(_KEY_OWNER): "owner",
+        pygame.key.key_code(config.KEY_CYCLE_AD): "ad",
     }
     controls = _Controls(callbacks)
     layout = _make_layout(screen.get_size())
@@ -418,10 +429,10 @@ def _draw_highlight(screen: pygame.Surface, layout: _Layout, highlight: Highligh
     box = layout.window_rect(highlight.xyxy)
     if box.width < 2 or box.height < 2:
         return
-    color = _HIGHLIGHT_SHOWN if highlight.state == "show" else _HIGHLIGHT_BLURRED
+    color, state_word = _STATE_STYLES.get(highlight.state, _STATE_STYLES["blur"])
     pygame.draw.rect(screen, color, box, width=_OUTLINE_PX)
 
-    words = [highlight.label, "shown" if highlight.state == "show" else "blurred"]
+    words = [highlight.label, state_word]
     if highlight.is_owner:
         words.append("owner")
     pad = max(2, layout.gap // 2)

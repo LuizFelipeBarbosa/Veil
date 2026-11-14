@@ -19,11 +19,11 @@ import queue
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 import config
-from contracts import KNOWN_CLASSES, TOOL_SCHEMAS
-from voice.tools import ToolHandlers, parse_keywords
+from contracts import AD_CLASSES, KNOWN_CLASSES, TOOL_SCHEMAS
+from voice.tools import NO_AD_IMAGES, ToolHandlers, parse_keywords
 
 # role is "you" or "agent"
 OnTranscript = Callable[[str, str], None]
@@ -36,9 +36,10 @@ _MIC_BLOCK = config.MIC_SAMPLE_RATE // 20  # 50 ms of audio per send
 _TRANSCRIPT_WAIT_S = 10.0  # after release, give up waiting for the user transcript
 _RECONNECT_DELAYS_S = (1.0, 2.0, 5.0, 10.0)
 
-_PROMPT = f"""\
+_COMMANDS_PROMPT = f"""\
 You are the voice control of a handheld privacy camera. You change what it blurs only by
-calling tools; you cannot see the video. Everything starts blurred except the camera owner.
+calling tools; you cannot see the video. Everything private starts blurred except the camera
+owner; ads ({", ".join(AD_CLASSES)}) start shown.
 
 The KNOWN TYPES are exactly: {", ".join(KNOWN_CLASSES)}.
 ("plates" means license plate, "storefronts" means storefront sign, "signs" on a street means street sign.)
@@ -88,9 +89,30 @@ C. Everything at once:
 
 D. A type that is NOT a known type (logos, tattoos, cars, screens): call no tool and say
    "I can hide faces, plates, street signs, house numbers, storefronts."
+"""
 
+_REPLY_PROMPT = f"""
 If a tool returns ok false, say briefly that it didn't work.
 Reply in plain words, under {config.AGENT_REPLY_MAX_WORDS} words, no ids, no lists, no markdown.
+"""
+
+
+def _ads_prompt(ad_assets: Sequence[str]) -> str:
+    """Path E: replacing ads with an image. Ads are not private, so this is not blur or unblur."""
+    if not ad_assets:
+        return """
+E. Replacing ads: there are no ad images on this device. Call no tool and say so.
+"""
+    return f"""
+E. Replacing ads with an image. Ads are not private; this is not blurring. Only the ad types
+   can be replaced, only with these ad images (exact file names): {", ".join(ad_assets)}.
+   "Replace the ads" with no image named -> set_replacement(label, "{ad_assets[0]}") for EVERY
+   ad type, no get_scene.
+   "Put the X ad on the posters" -> set_replacement(label="poster", asset=X's file name). No
+   image fits X -> call no tool and say which images there are.
+   "Stop replacing the ads", "show the real ads" -> set_class_rule(label, "show") for every ad
+   type, or only the type named.
+   Blurring or showing ads is path A: "blur the posters" -> set_class_rule(label="poster", action="blur").
 """
 
 
@@ -101,12 +123,14 @@ def build_settings(
     temperature: float | None = config.DG_THINK_TEMPERATURE,
     speak_model: str | None = None,
     reasoning_mode: str | None = None,
+    ad_assets: Sequence[str] = (),
 ) -> dict[str, Any]:
-    """The Voice Agent Settings message: Flux, hosted think model, Aura-2, the 6 tools, the prompt.
+    """The Voice Agent Settings message: Flux, hosted think model, Aura-2, the 7 tools, the prompt.
 
     The keyword arguments let scripts/voice_check.py try other hosted models;
     temperature=None leaves it out, for models that only accept their default;
     reasoning_mode is for OpenAI reasoning models (gpt-5 family and later).
+    ad_assets are the ad image file names the prompt offers for set_replacement.
     """
     think_provider_settings: dict[str, Any] = {
         "type": think_provider or config.DG_THINK_PROVIDER,
@@ -134,7 +158,7 @@ def build_settings(
             },
             "think": {
                 "provider": think_provider_settings,
-                "prompt": _PROMPT,
+                "prompt": _COMMANDS_PROMPT + _ads_prompt(ad_assets) + _REPLY_PROMPT,
                 "functions": [dict(schema) for schema in TOOL_SCHEMAS],
             },
             "speak": {"provider": {"type": "deepgram", "model": speak_model or config.DG_SPEAK_MODEL}},
@@ -178,7 +202,7 @@ class VoiceAgent(threading.Thread):
         self._on_transcript = on_transcript
         self._use_audio = use_audio
         self._keyword_fallback_s = keyword_fallback_s
-        self._settings = build_settings(**settings_overrides)
+        self._settings = build_settings(ad_assets=handlers.ad_assets, **settings_overrides)
         self._api_key = os.environ.get(config.DEEPGRAM_API_KEY_ENV, "")
 
         self._loop = asyncio.new_event_loop()
@@ -434,15 +458,21 @@ class VoiceAgent(threading.Thread):
 
     def _run_keyword_fallback(self) -> None:
         turn, self._turn = self._turn, None
-        match = parse_keywords(turn.user_text) if turn else None
-        if match is None:
+        calls = parse_keywords(turn.user_text, self._handlers.ad_assets) if turn else []
+        if not calls:
             if not self._ready.is_set():
                 self._say("agent", "Voice offline")
             return
-        name, arguments = match
-        result = self._handlers.handle(name, arguments)
-        _log.info("keyword fallback %s %s -> %s", name, arguments, result)
-        self._say("agent", "Done." if result.get("ok") else "Couldn't do that.")
+        errors = []
+        for name, arguments in calls:
+            result = self._handlers.handle(name, arguments)
+            _log.info("keyword fallback %s %s -> %s", name, arguments, result)
+            if not result.get("ok"):
+                errors.append(result.get("error"))
+        if not errors:
+            self._say("agent", "Done.")
+        else:
+            self._say("agent", NO_AD_IMAGES if NO_AD_IMAGES in errors else "Couldn't do that.")
 
 
 class _Speaker:

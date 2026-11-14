@@ -206,6 +206,26 @@ def test_keys_trigger_every_button() -> None:
     assert app.calls == [("record",), ("talk", True), ("talk", False), ("panic", True), ("owner",)]
 
 
+def test_ad_key_cycles_once_per_key_down() -> None:
+    ad_key = ord(config.KEY_CYCLE_AD)  # a letter key's pygame code is its ASCII code
+    app = _FakeApp()
+    app.run({
+        1: [_key_down(ad_key)],
+        2: [_key_down(ad_key)],  # no KEYUP yet: a repeat, not a new press
+        3: [_key_up(ad_key)],
+        4: [_key_down(ad_key), _key_up(ad_key)],
+    }, on_cycle_ad=lambda: app.calls.append(("ad",)))
+    assert app.calls == [("ad",), ("ad",)]
+
+
+def test_ad_key_works_with_the_default_callbacks() -> None:
+    ad_key = ord(config.KEY_CYCLE_AD)  # a letter key's pygame code is its ASCII code
+    app = _FakeApp()
+    app.run({1: [_key_down(ad_key), _key_up(ad_key)], 2: [_key_down(pygame.K_e)]})  # no on_cycle_ad given
+    assert app.calls == [("owner",)]
+    assert UiCallbacks().on_cycle_ad() is None
+
+
 def test_escape_quits() -> None:
     app = _FakeApp()
     app.run({1: [_key_down(pygame.K_ESCAPE)]}, frames=50)
@@ -406,8 +426,20 @@ def test_highlights_are_outlined_at_their_scaled_position(size: tuple[int, int])
         assert with_boxes.get_at(inside) == without.get_at(inside)  # outline only, no fill
 
 
-def test_blurred_and_shown_outlines_differ() -> None:
-    assert ui._HIGHLIGHT_BLURRED != ui._HIGHLIGHT_SHOWN
+def test_blurred_shown_and_replaced_outlines_differ() -> None:
+    assert len({ui._HIGHLIGHT_BLURRED, ui._HIGHLIGHT_SHOWN, ui._HIGHLIGHT_REPLACED}) == 3
+
+
+def test_replaced_ads_get_their_own_outline_and_tag() -> None:
+    size = ui._default_window_size()
+    ad = Highlight(id="obj#4", label="billboard", xyxy=(100, 100, 400, 260), state="replace")
+    plain = _pixelated_frame()
+    screen = _render(size, _with_highlights(plain, (ad,)))
+    box = ui._make_layout(size).window_rect(ad.xyxy)
+    assert tuple(screen.get_at((box.left, box.centery)))[:3] == ui._HIGHLIGHT_REPLACED
+    tag_pixels = pygame.surfarray.array3d(screen.subsurface(pygame.Rect(box.x, box.y - 30, box.width, 30)))
+    assert np.all(tag_pixels == ui._HIGHLIGHT_REPLACED, axis=-1).any()  # the tag text is in the ad colour
+    assert ui._STATE_STYLES["replace"][1] == "ad"
 
 
 def test_fail_closed_frames_show_no_highlights() -> None:
@@ -574,6 +606,7 @@ def test_draw_handles_every_state_at_every_size() -> None:
     edge_cases = HIGHLIGHTS + (
         Highlight(id="edge", label="a very long label for a tiny box", xyxy=(0, 0, 3, 3), state="show"),
         Highlight(id="corner", label="face", xyxy=(600, 440, 640, 480), state="blur", is_owner=True),
+        Highlight(id="ad", label="advertisement", xyxy=(0, 400, 640, 480), state="replace"),
     )
     for size in SIZES:
         for frame in (_pixelated_frame(), _with_highlights(_pixelated_frame(), edge_cases)):
