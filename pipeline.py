@@ -63,6 +63,7 @@ class Pipeline(threading.Thread):
         self._watchdog = render.Watchdog(watch_objects=False)  # WP5 turns the object watchdog on
         self._seen_track_ids: set[str] = set()
         self._owner_id: str | None = None
+        self._owner_lost_at: dict[str, int] = {}  # track id -> frame index where it stopped being the owner
         self._enroll_requested = threading.Event()
 
     def latest(self) -> CensoredFrame | None:
@@ -128,13 +129,14 @@ class Pipeline(threading.Thread):
     def _detect(self, frame: BufferedFrame) -> None:
         """Faces on the newest frame: track, identify, hold over, backfill, heartbeat."""
         now = time.monotonic()
-        tracked = self._face_tracker.update(self._faces.detect(frame.image), frame.index, now)
+        detections = self._faces.detect(frame.image)
+        tracked = _without_weak_duplicates(self._face_tracker.update(detections, frame.index, now))
         if self._enroll_requested.is_set():
             self._enroll_largest_face(frame.image, tracked)
         self._identity.update(frame.image, tracked, self._policy, now)
-        self._owner_id = next((box.id for box in tracked if box.is_owner), None)
+        self._follow_owner(tracked, frame.index)
 
-        frame.boxes.extend(self._with_held_boxes(tracked, now, frame.index))
+        frame.boxes.extend(self._hold_over.apply(tracked, now, frame_index=frame.index))
         new_boxes = [box for box in tracked if box.id not in self._seen_track_ids]
         self._seen_track_ids.update(box.id for box in new_boxes)
         render.backfill(self._ring.recent(config.BACKFILL_FRAMES + 1)[:-1], new_boxes)
@@ -146,13 +148,15 @@ class Pipeline(threading.Thread):
         with self._latest_lock:
             self._scene = scene
 
-    def _with_held_boxes(self, tracked: list[TrackedBox], now: float, frame_index: int) -> list[TrackedBox]:
-        """This frame's boxes plus held-over ones. A held box is a guess, so it is never the owner."""
-        tracked_ids = {box.id for box in tracked}
-        return [
-            box if box.id in tracked_ids else dataclasses.replace(box, is_owner=False)
-            for box in self._hold_over.apply(tracked, now, frame_index=frame_index)
-        ]
+    def _follow_owner(self, tracked: list[TrackedBox], frame_index: int) -> None:
+        """Remember when a track that is still in frame stops being the owner (a failed ID re-check)."""
+        owner_id = next((box.id for box in tracked if box.is_owner), None)
+        previous = self._owner_id
+        if previous is not None and previous != owner_id and any(box.id == previous for box in tracked):
+            self._owner_lost_at[previous] = frame_index
+        if owner_id != previous:
+            log.info("owner track: %s -> %s", previous, owner_id)
+        self._owner_id = owner_id
 
     def _enroll_largest_face(self, image: np.ndarray, tracked: list[TrackedBox]) -> None:
         candidates = [
@@ -172,11 +176,25 @@ class Pipeline(threading.Thread):
         )
 
     def _decide(self, box: TrackedBox, policy: PolicySnapshot) -> Action:
-        """policy.decide, except that a buffered box only counts as the owner while its track still is.
+        """policy.decide, except that an owner mark is void once its track failed the ID re-check.
 
-        The frame leaving the buffer was marked a second ago; if the ID-swap check has
-        since taken ownership away from that track, the old mark must not show a face.
+        The frame leaving the buffer was marked a second ago. If that track has since
+        lost ownership, the frames marked before the loss must not show the face.
         """
-        if box.is_owner and box.id != self._owner_id:
+        if box.is_owner and box.frame_index <= self._owner_lost_at.get(box.id, -1):
             box = dataclasses.replace(box, is_owner=False)
         return policy_rules.decide(box, policy)
+
+
+def _without_weak_duplicates(boxes: list[TrackedBox]) -> list[TrackedBox]:
+    """Drop a weak box whose centre lies inside a confident box: it is the same face, seen twice.
+
+    Without this, a stray low-score hit on the owner's own face would blur the owner.
+    """
+    confident = [box for box in boxes if box.conf >= config.SCENE_MIN_CONF]
+
+    def inside_a_confident_box(box: TrackedBox) -> bool:
+        centre_x, centre_y = (box.xyxy[0] + box.xyxy[2]) / 2, (box.xyxy[1] + box.xyxy[3]) / 2
+        return any(c.xyxy[0] <= centre_x <= c.xyxy[2] and c.xyxy[1] <= centre_y <= c.xyxy[3] for c in confident)
+
+    return [box for box in boxes if box.conf >= config.SCENE_MIN_CONF or not inside_a_confident_box(box)]

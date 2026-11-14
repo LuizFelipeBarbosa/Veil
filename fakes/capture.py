@@ -31,13 +31,13 @@ class FileSource:
             ok, image = self._video.read()
         if not ok:
             return None
-        return _cover(image, config.FRAME_WIDTH, config.FRAME_HEIGHT)
+        return cover(image, config.FRAME_WIDTH, config.FRAME_HEIGHT)
 
     def release(self) -> None:
         self._video.release()
 
 
-def _cover(image: np.ndarray, width: int, height: int) -> np.ndarray:
+def cover(image: np.ndarray, width: int, height: int) -> np.ndarray:
     """Scale to cover width x height, then crop the centre."""
     source_height, source_width = image.shape[:2]
     scale = max(width / source_width, height / source_height)

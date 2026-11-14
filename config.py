@@ -36,7 +36,7 @@ CAMERA_FACES_OPERATOR = not _ON_PI
 
 # --- faces (YuNet) and owner (SFace) ---
 YUNET_INPUT_SIZE = (320, 240) if _ON_PI else (640, 480)  # (width, height)
-FACE_SCORE = 0.3  # Brief: 0.6. Lowered after the leak test: real faces scored 0.3-0.6 went unblurred
+FACE_SCORE = 0.4  # Brief: 0.6. Lowered after the leak test (real faces scored 0.3-0.6 went unblurred); 0.3 blurred too much
 SFACE_COSINE_MATCH = 0.363
 ID_RECHECK_S = 1.0
 
@@ -48,7 +48,7 @@ YOLOE_CLASSES = ("license plate", "street sign", "house number", "storefront sig
 YOLOE_CONF = 0.25
 
 # --- censoring ---
-BOX_PADDING = 0.35  # per side. Brief: 0.20. Raised after the leak test: cheeks and ears showed
+BOX_PADDING = 0.25  # per side. Brief: 0.20. 0.35 was too much on the live preview
 HOLD_OVER_S = 0.5  # a lost track stays blurred this long
 PIXEL_BLOCK = 16  # px
 FACE_WATCHDOG_S = 0.300  # no finished face detection for this long: whole frame pixelates

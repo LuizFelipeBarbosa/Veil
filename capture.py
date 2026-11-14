@@ -16,7 +16,7 @@ import numpy as np
 
 import config
 from contracts import BufferedFrame
-from fakes.capture import FileSource
+from fakes.capture import FileSource, cover
 
 log = logging.getLogger(__name__)
 
@@ -53,9 +53,8 @@ class _CameraSource:
         ok, image = self._video.read()
         if not ok or image is None:
             return None
-        if image.shape[:2] != (config.FRAME_HEIGHT, config.FRAME_WIDTH):
-            image = cv2.resize(image, (config.FRAME_WIDTH, config.FRAME_HEIGHT))
-        return image
+        # A 16:9 camera is cropped to the frame's shape, never stretched: stretched faces detect badly.
+        return cover(image, config.FRAME_WIDTH, config.FRAME_HEIGHT)
 
     def release(self) -> None:
         self._video.release()
