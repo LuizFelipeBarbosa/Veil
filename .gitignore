@@ -8,3 +8,5 @@ __pycache__/
 .venv/
 weights/
 .claude/worktrees/
+tests/data/*.mov
+tests/data/*.MOV
