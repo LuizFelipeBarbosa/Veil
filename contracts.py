@@ -12,14 +12,20 @@ from typing import Any, Literal, Mapping
 
 import numpy as np
 
-Action = Literal["blur", "show"]
+Action = Literal["blur", "show", "replace"]
 Side = Literal["owner_left", "owner_right", "left", "center", "right"]
 Distance = Literal["near", "far"]
 
 FACE = "face"
-OBJECT_CLASSES = ("license plate", "street sign", "house number", "storefront sign")
+CENSORED_OBJECT_CLASSES = ("license plate", "street sign", "house number", "storefront sign")
+# Ads are not private: they start shown, and are the only classes that can be replaced by an image.
+AD_CLASSES = ("billboard", "poster", "advertisement")
+OBJECT_CLASSES = (*CENSORED_OBJECT_CLASSES, *AD_CLASSES)
 KNOWN_CLASSES = (FACE, *OBJECT_CLASSES)
+# What a class rule or a track override can be set to directly. "replace" is set
+# only through Policy.set_replacement, and only for AD_CLASSES.
 ACTIONS: tuple[Action, ...] = ("blur", "show")
+REPLACE: Action = "replace"
 
 FACE_ID_PREFIX = "face"  # track IDs look like face#7
 OBJECT_ID_PREFIX = "obj"  # and obj#3
@@ -78,7 +84,7 @@ class Highlight:
     id: str
     label: str
     xyxy: tuple[int, int, int, int]  # frame pixels, unpadded
-    state: Action  # what the frame shows for it right now
+    state: Action  # what the frame shows for it right now ("replace": an ad image is drawn over it)
     is_owner: bool = False
 
 
@@ -98,6 +104,10 @@ class CensoredFrame:
 
 # --- policy ----------------------------------------------------------------
 
+DEFAULT_CLASS_RULES: Mapping[str, Action] = MappingProxyType(
+    {label: ("show" if label in AD_CLASSES else "blur") for label in KNOWN_CLASSES}
+)
+
 
 @dataclass(frozen=True)
 class PolicySnapshot:
@@ -109,12 +119,14 @@ class PolicySnapshot:
     # Goes up each time the face class is set to "blur". Whoever remembers
     # unblurred people (vision/identity.py) must forget them all when it changes.
     face_reset_count: int = 0
+    # Ad class -> image file name in config.ADS_DIR, for every class whose rule is "replace".
+    replacements: Mapping[str, str] = field(default_factory=dict)
 
 
 class Policy:
     """The only state the agent and the buttons can change. Thread-safe.
 
-    Everything starts blurred. The limits live here so no caller can skip them:
+    Everything private starts blurred; ads (AD_CLASSES) start shown. The limits live here so no caller can skip them:
     unknown labels and actions are refused, and blurring the face class clears
     every face override and makes every remembered person forgotten.
 
@@ -124,7 +136,8 @@ class Policy:
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
-        self._class_rules: dict[str, Action] = {label: "blur" for label in KNOWN_CLASSES}
+        self._class_rules: dict[str, Action] = dict(DEFAULT_CLASS_RULES)
+        self._replacements: dict[str, str] = {}
         self._track_overrides: dict[str, Action] = {}
         self._panic = False
         self._face_reset_count = 0
@@ -136,6 +149,7 @@ class Policy:
                 track_overrides=MappingProxyType(dict(self._track_overrides)),
                 panic=self._panic,
                 face_reset_count=self._face_reset_count,
+                replacements=MappingProxyType(dict(self._replacements)),
             )
 
     def to_dict(self) -> dict[str, Any]:
@@ -144,6 +158,7 @@ class Policy:
             "class_rules": dict(snapshot.class_rules),
             "track_overrides": dict(snapshot.track_overrides),
             "panic": snapshot.panic,
+            "replacements": dict(snapshot.replacements),
         }
 
     def set_class_rule(self, label: str, action: Action) -> None:
@@ -151,15 +166,30 @@ class Policy:
 
         ("face", "show") keeps everyone unblurred, including people who arrive later,
         until ("face", "blur"), which also clears every per-person choice.
+        Setting an ad class to "blur" or "show" turns its replacement off.
         """
         _require_action(action)
         if label not in KNOWN_CLASSES:
             raise ValueError(f"unknown label {label!r}; known: {', '.join(KNOWN_CLASSES)}")
         with self._lock:
             self._class_rules[label] = action
+            self._replacements.pop(label, None)
             if label == FACE and action == "blur":
                 self._clear_overrides(FACE_ID_PREFIX)
                 self._face_reset_count += 1
+
+    def set_replacement(self, label: str, asset: str) -> None:
+        """Draw the image `asset` over every box of an ad class. Raises ValueError for any other class.
+
+        The caller checks that `asset` is a file in config.ADS_DIR.
+        """
+        if label not in AD_CLASSES:
+            raise ValueError(f"only ads can be replaced ({', '.join(AD_CLASSES)}), not {label!r}")
+        if not asset:
+            raise ValueError("no ad image named")
+        with self._lock:
+            self._class_rules[label] = REPLACE
+            self._replacements[label] = asset
 
     def set_track_override(self, track_id: str, action: Action) -> None:
         """The caller checks that track_id is in the live scene."""
@@ -178,11 +208,12 @@ class Policy:
     def show_all(self) -> None:
         """Unblur everything and keep it unblurred: every class, faces included. Turns panic off.
 
-        Per-track "blur" choices stay, so select things can still be hidden.
+        Per-track "blur" choices stay, so select things can still be hidden. Replaced ads stay replaced.
         """
         with self._lock:
             for label in KNOWN_CLASSES:
-                self._class_rules[label] = "show"
+                if self._class_rules[label] != REPLACE:
+                    self._class_rules[label] = "show"
             self._panic = False
 
     def _clear_overrides(self, id_prefix: str) -> None:
@@ -230,7 +261,7 @@ class Scene:
         return {track.id for track in self.tracks}
 
 
-EMPTY_SCENE = Scene(owner=None, tracks=(), class_rules={label: "blur" for label in KNOWN_CLASSES}, panic=False)
+EMPTY_SCENE = Scene(owner=None, tracks=(), class_rules=dict(DEFAULT_CLASS_RULES), panic=False)
 
 
 # --- agent tools -----------------------------------------------------------
@@ -250,7 +281,8 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     },
     {
         "name": "set_class_rule",
-        "description": "Blur or show a whole class. Showing the face class unblurs everyone and "
+        "description": "Blur or show a whole class. For an ad class this also turns its replacement "
+        "off. Showing the face class unblurs everyone and "
         "keeps people who arrive later unblurred too; blurring it blurs everyone again and forgets "
         "every per-person choice.",
         "parameters": {
@@ -273,6 +305,19 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "action": _ACTION_PARAM,
             },
             "required": ["track_id", "action"],
+        },
+    },
+    {
+        "name": "set_replacement",
+        "description": "Replace every billboard, poster or advertisement in view with one of the ad "
+        "images on the device. Turn it off with set_class_rule(label, show).",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "label": {"type": "string", "enum": list(AD_CLASSES)},
+                "asset": {"type": "string", "description": "An ad image file name from the list in the prompt"},
+            },
+            "required": ["label", "asset"],
         },
     },
     {

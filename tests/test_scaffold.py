@@ -12,7 +12,7 @@ import pytest
 
 import config
 import contracts
-from contracts import KNOWN_CLASSES, Policy
+from contracts import AD_CLASSES, KNOWN_CLASSES, Policy
 from fakes import scenes
 from fakes.capture import FileSource
 from pipeline import Pipeline, fail_closed_frame
@@ -35,12 +35,37 @@ def test_every_module_imports(module: str) -> None:
 # --- policy ---
 
 
-def test_policy_starts_with_everything_blurred() -> None:
+def test_policy_starts_with_everything_private_blurred_and_ads_shown() -> None:
     assert Policy().to_dict() == {
-        "class_rules": {label: "blur" for label in KNOWN_CLASSES},
+        "class_rules": {label: ("show" if label in AD_CLASSES else "blur") for label in KNOWN_CLASSES},
         "track_overrides": {},
         "panic": False,
+        "replacements": {},
     }
+
+
+def test_only_ads_can_be_replaced_and_a_class_rule_turns_it_off() -> None:
+    policy = Policy()
+    for label in ("face", "license plate", "logo"):
+        with pytest.raises(ValueError):
+            policy.set_replacement(label, "ad.png")
+    with pytest.raises(ValueError):
+        policy.set_class_rule("poster", "replace")  # replace goes through set_replacement only
+    with pytest.raises(ValueError):
+        policy.set_track_override("face#1", "replace")
+
+    policy.set_replacement("poster", "ad.png")
+    replaced = policy.snapshot()
+    assert replaced.class_rules["poster"] == "replace"
+    assert replaced.replacements == {"poster": "ad.png"}
+
+    policy.show_all()  # unblurring everything leaves a replaced ad replaced
+    assert policy.snapshot().class_rules["poster"] == "replace"
+
+    policy.set_class_rule("poster", "show")
+    off = policy.snapshot()
+    assert off.class_rules["poster"] == "show"
+    assert off.replacements == {}
 
 
 def test_showing_the_face_class_is_an_explicit_choice_and_blurring_it_resets() -> None:
@@ -85,7 +110,7 @@ def test_show_all_unblurs_every_class_keeps_blur_choices_and_clears_panic() -> N
     policy.set_track_override("face#7", "blur")
     policy.show_all()
     shown = policy.snapshot()
-    assert shown.class_rules == {label: "show" for label in KNOWN_CLASSES}
+    assert shown.class_rules == {label: "show" for label in KNOWN_CLASSES}  # nothing was replaced
     assert shown.track_overrides == {"face#7": "blur"}
     assert shown.panic is False
 
@@ -113,8 +138,11 @@ def test_scene_dict_matches_the_brief() -> None:
 
 
 def test_the_tools() -> None:
-    assert contracts.TOOL_NAMES == ("get_scene", "set_class_rule", "set_track", "blur_all", "clear_panic", "show_all")
+    assert contracts.TOOL_NAMES == (
+        "get_scene", "set_class_rule", "set_track", "set_replacement", "blur_all", "clear_panic", "show_all",
+    )
     by_name = {schema["name"]: schema for schema in contracts.TOOL_SCHEMAS}
+    assert by_name["set_replacement"]["parameters"]["properties"]["label"]["enum"] == list(AD_CLASSES)
     assert by_name["set_class_rule"]["parameters"]["properties"]["label"]["enum"] == list(KNOWN_CLASSES)
     assert by_name["set_track"]["parameters"]["required"] == ["track_id", "action"]
     assert all("endpoint" not in schema for schema in contracts.TOOL_SCHEMAS)  # client-side
