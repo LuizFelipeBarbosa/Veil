@@ -45,6 +45,27 @@ _MIN_SAME_SIGN_IOU = 0.3
 # A found quad further than this share of the box diagonal (mean corner distance) from the prediction
 # is another outline (a poster inside the billboard, a passer-by) and is ignored.
 _MAX_QUAD_JUMP = 0.12
+# A found quad whose area differs from the sign's by more than this factor is the pane or the frame
+# around the panel, not the panel: ignored like a jump.
+_MAX_AREA_CHANGE = 1.3
+# After this many ignored quads in a row the sign has really moved (a fast pan): it restarts at the quad.
+_REJECTS_BEFORE_RESTART = 3
+# A box overlapping the sign's last box less than this has jumped: the sign restarts at the measurement.
+_MIN_STEADY_IOU = 0.5
+# Scene cuts: the frame is shrunk to a 16 x 12 colour thumbnail; when this share of its cells changed by
+# more than _CUT_CELL_CHANGE levels since the last call, it is a cut. On the ad clip a hard cut changes
+# 62% of cells, a fast pan at most 8%.
+_THUMBNAIL_SIZE = (16, 12)
+_CUT_CELL_CHANGE = 32
+_CUT_SHARE = 0.3
+# Shading: each ad pixel is multiplied by how bright the scene is there against the sign's surface
+# around it, so posts, glass frames and passers-by darker than the sign stay visible through the ad.
+# Pixels at least _SHADE_FULL of the surface keep the ad untouched (the old poster's own content
+# is flattened); darker ones fade the ad down to black at _SHADE_DARK.
+_SHADE_FULL = 0.6
+_SHADE_DARK = 0.2
+_SHADE_OFFSET = 16.0  # added to both luminances, so near-black scenes are not read as dark structure
+_SURFACE_CELLS = 6  # the surface brightness is the region averaged on this grid, then smoothed back up
 _MAX_ASSET_SIDE = 640  # px; assets are shrunk to this on load, which bounds the cache and the warp
 
 
@@ -73,19 +94,24 @@ class _Sign:
         self.corners: np.ndarray | None = None  # frame px; set by the first update
         self.velocity = np.zeros((4, 2), np.float32)  # px/s per corner
         self.shape: np.ndarray | None = None  # corners in box-relative units (0..1), once a quad was found
+        self.rejected = 0  # found quads ignored in a row
         self.updated = now
 
 
 class AdReplacer:
     """Warps an ad image onto each replaced sign, with its corners filtered per sign.
 
-    Keeps only the loaded ad images and each sign's corners: never a frame.
+    Keeps only the loaded ad images, each sign's corners and a 16 x 12 thumbnail of the last frame
+    (576 averaged colours, to notice scene cuts): never a frame.
     """
 
     def __init__(self, directory: Path = config.ADS_DIR) -> None:
         self._directory = directory
         self._assets: dict[str, np.ndarray | None] = {}  # None: missing or unreadable, logged once
         self._signs: list[_Sign] = []
+        self._thumbnail: np.ndarray | None = None
+        self._newest_seen = float("-inf")  # newest last_seen of any box so far
+        self._stale_until = float("-inf")  # boxes last seen at or before this belong to the scene before a cut
 
     def draw(
         self, image: np.ndarray, boxes: Sequence[TrackedBox], assets: Mapping[str, str], now: float
@@ -98,8 +124,13 @@ class AdReplacer:
         """
         out = image.copy()
         height, width = image.shape[:2]
+        if self._scene_cut(image):  # nothing from the old scene may carry over, not even held-over boxes
+            self._signs = []
+            self._stale_until = self._newest_seen
+        self._newest_seen = max([self._newest_seen, *(box.last_seen for box in boxes)])
+        fresh = [box for box in boxes if box.last_seen > self._stale_until]
         unmatched = list(self._signs)
-        for box in _one_per_sign(boxes):
+        for box in _one_per_sign(fresh):
             asset = self._asset(assets.get(box.label, ""))
             xyxy = _clipped(box.xyxy, width, height)
             if asset is None or xyxy[2] - xyxy[0] < 2 or xyxy[3] - xyxy[1] < 2:
@@ -111,9 +142,18 @@ class AdReplacer:
             else:
                 unmatched.remove(sign)
             _update(sign, _find_quad(image, xyxy), xyxy, box.last_seen, now)
-            _warp_into_box(out, asset, sign.corners, xyxy)
+            _warp_into_box(out, image, asset, sign.corners, xyxy)
         self._signs = [sign for sign in self._signs if now - sign.updated <= config.HOLD_OVER_S]
         return out
+
+    def _scene_cut(self, image: np.ndarray) -> bool:
+        """Whether most of the frame changed since the last call; remembers this frame's thumbnail."""
+        thumbnail = cv2.resize(image, _THUMBNAIL_SIZE, interpolation=cv2.INTER_AREA).astype(np.int16)
+        previous, self._thumbnail = self._thumbnail, thumbnail
+        if previous is None:
+            return False
+        changed = np.abs(thumbnail - previous).max(axis=2) > _CUT_CELL_CHANGE
+        return changed.mean() > _CUT_SHARE
 
     def _asset(self, name: str) -> np.ndarray | None:
         """The cached image for `name`, loaded on first use. Logs a missing one once."""
@@ -151,16 +191,19 @@ def _update(
 ) -> None:
     """One alpha-beta step: predict with the velocity, correct with the quad or else the box-relative shape."""
     origin, size = np.float32(xyxy[:2]), np.float32([xyxy[2] - xyxy[0], xyxy[3] - xyxy[1]])
-    if sign.corners is None:  # a new sign starts where it is measured
-        sign.corners = found if found is not None else _box_corners(xyxy)
-        sign.shape = None if found is None else (found - origin) / size
-        sign.box_seen = box_seen
+    if sign.corners is None or _iou(sign.box, xyxy) < _MIN_STEADY_IOU:
+        _restart(sign, found, xyxy, box_seen, now)  # new, or the box jumped: no sliding from the old place
         return
     dt = now - sign.updated
     predicted = sign.corners + sign.velocity * dt
-    jump = None if found is None else np.linalg.norm(found - predicted, axis=1).mean()
-    if sign.shape is not None and jump is not None and jump > _MAX_QUAD_JUMP * np.linalg.norm(size):
-        found = None  # another outline; a sign without a shape yet takes the first quad it finds
+    if found is not None and sign.shape is not None and _is_other_outline(found, predicted, size):
+        sign.rejected += 1
+        if sign.rejected >= _REJECTS_BEFORE_RESTART:  # consistently elsewhere: the sign moved, follow it
+            _restart(sign, found, xyxy, box_seen, now)
+            return
+        found = None  # a sign without a shape yet takes the first quad it finds
+    elif found is not None:
+        sign.rejected = 0
     if found is not None:
         measured, gain = found, _QUAD_GAIN
         relative = (found - origin) / size
@@ -177,6 +220,25 @@ def _update(
     if dt > 0:
         sign.velocity += _VELOCITY_GAIN * residual / dt
     sign.box, sign.box_seen, sign.updated = xyxy, box_seen, now
+
+
+def _restart(
+    sign: _Sign, found: np.ndarray | None, xyxy: tuple[int, int, int, int], box_seen: float, now: float
+) -> None:
+    """The sign starts where it is measured, standing still."""
+    origin, size = np.float32(xyxy[:2]), np.float32([xyxy[2] - xyxy[0], xyxy[3] - xyxy[1]])
+    sign.corners = found if found is not None else _box_corners(xyxy)
+    sign.shape = None if found is None else (found - origin) / size
+    sign.velocity = np.zeros((4, 2), np.float32)
+    sign.rejected = 0
+    sign.box, sign.box_seen, sign.updated = xyxy, box_seen, now
+
+
+def _is_other_outline(found: np.ndarray, predicted: np.ndarray, size: np.ndarray) -> bool:
+    """A quad far from the prediction or of another size: a poster inside, a passer-by, the glass pane."""
+    jump = np.linalg.norm(found - predicted, axis=1).mean()
+    area_change = cv2.contourArea(found) / max(1.0, cv2.contourArea(predicted))
+    return jump > _MAX_QUAD_JUMP * np.linalg.norm(size) or not 1 / _MAX_AREA_CHANGE <= area_change <= _MAX_AREA_CHANGE
 
 
 def _grown(xyxy: tuple[int, int, int, int], width: int, height: int) -> tuple[int, int, int, int]:
@@ -266,9 +328,9 @@ def _ordered(points: np.ndarray) -> np.ndarray:
 
 
 def _warp_into_box(
-    out: np.ndarray, asset: np.ndarray, corners: np.ndarray, xyxy: tuple[int, int, int, int]
+    out: np.ndarray, image: np.ndarray, asset: np.ndarray, corners: np.ndarray, xyxy: tuple[int, int, int, int]
 ) -> None:
-    """Warp `asset` onto `corners`, writing only inside the box. Works on the box-sized region alone."""
+    """Warp `asset` onto `corners`, shaded by `image`, writing only inside the box. Works on the box region alone."""
     x1, y1, x2, y2 = xyxy
     asset_h, asset_w = asset.shape[:2]
     source = np.float32([[0, 0], [asset_w, 0], [asset_w, asset_h], [0, asset_h]])
@@ -278,4 +340,16 @@ def _warp_into_box(
     warped = cv2.warpPerspective(asset, homography, (x2 - x1, y2 - y1), flags=cv2.INTER_LINEAR)
     mask = np.zeros(region.shape[:2], dtype=np.uint8)
     cv2.fillConvexPoly(mask, np.round(local).astype(np.int32), 255)
-    region[mask > 0] = warped[mask > 0]
+    shading = cv2.cvtColor(_shading(image[y1:y2, x1:x2]), cv2.COLOR_GRAY2BGR)
+    shaded = cv2.multiply(warped, shading, dtype=cv2.CV_8U)
+    np.copyto(region, shaded, where=mask[..., None] > 0)
+
+
+def _shading(region: np.ndarray) -> np.ndarray:
+    """Per pixel 0..1: 1 on the sign's surface, less where something clearly darker is (a post, a frame)."""
+    luminance = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    height, width = luminance.shape
+    cells = cv2.resize(luminance, (_SURFACE_CELLS, _SURFACE_CELLS), interpolation=cv2.INTER_AREA)
+    surface = cv2.resize(cells, (width, height), interpolation=cv2.INTER_LINEAR)
+    ratio = (luminance + _SHADE_OFFSET) / (surface + _SHADE_OFFSET)
+    return np.clip((ratio - _SHADE_DARK) / (_SHADE_FULL - _SHADE_DARK), 0.0, 1.0)

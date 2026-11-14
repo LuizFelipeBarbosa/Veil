@@ -227,3 +227,76 @@ def test_draw_is_cheap(ads_dir: Path) -> None:
         replacer.draw(image, box, ASSETS, now=i * 0.07)
     per_draw_ms = (time.perf_counter() - started) / 20 * 1000
     assert per_draw_ms < 20  # budget ~5 ms per box on the Mac; generous for a loaded test machine
+
+
+# --- WP23: scene cuts, jumps, things in front of the sign ---
+
+
+def _shifted_skewed_sign(dx: int) -> np.ndarray:
+    image = _wall()
+    sign = SKEWED_SIGN + np.int32([dx, 0])
+    cv2.fillConvexPoly(image, sign, (240, 240, 240))
+    cv2.polylines(image, [sign], True, (20, 20, 20), 3)
+    return image
+
+
+def test_a_scene_cut_starts_fresh_and_drops_held_over_boxes(ads_dir: Path) -> None:
+    replacer = AdReplacer(ads_dir)
+    old_box = _box((470, 350, 630, 470), "obj#9", last_seen=0.07)
+    for step in range(3):  # the skewed sign's shape is learned; another sign elsewhere
+        now = step * 0.07
+        replacer.draw(_wall_with_skewed_sign(), [_box(SKEWED_SIGN_BOX, last_seen=now), old_box], ASSETS, now=now)
+    cut = np.full((HEIGHT, WIDTH, 3), 230, np.uint8)  # a very different frame, no outlines
+    boxes = [_box(SKEWED_SIGN_BOX, "obj#2", last_seen=0.21), old_box]  # same place, fresh; and a held-over box
+    out = replacer.draw(cut, boxes, ASSETS, now=0.21)
+    x1, y1, x2, y2 = SKEWED_SIGN_BOX
+    assert _is_ad(out[y1:y2, x1:x2]).mean() > 0.99  # the whole box: not the old scene's skewed shape
+    assert not _is_ad(out[350:470, 470:630]).any()  # the held-over box from before the cut is not drawn
+    out = replacer.draw(cut, boxes, ASSETS, now=0.28)
+    assert not _is_ad(out[350:470, 470:630]).any()  # nor later
+
+
+def test_a_box_that_jumps_restarts_at_its_new_place(ads_dir: Path) -> None:
+    image = np.zeros((HEIGHT, WIDTH, 3), np.uint8)  # no edges: the box itself is the measurement
+    replacer = AdReplacer(ads_dir)
+    for step in range(5):
+        replacer.draw(image, [_box((100, 50, 300, 200), last_seen=step * 0.07)], ASSETS, now=step * 0.07)
+    out = replacer.draw(image, [_box((170, 50, 370, 200), last_seen=0.35)], ASSETS, now=0.35)
+    assert _is_ad(out[50:200, 170:370]).mean() > 0.99  # no sliding in from the old place
+
+
+def test_a_sign_whose_outline_moves_far_restarts_within_a_few_frames(ads_dir: Path) -> None:
+    replacer = AdReplacer(ads_dir)
+    for step in range(3):
+        now = step * 0.07
+        replacer.draw(_wall_with_skewed_sign(), [_box(SKEWED_SIGN_BOX, last_seen=now)], ASSETS, now=now)
+    dx = 50  # beyond the 12 % jump the filter ignores as another outline
+    x1, y1, x2, y2 = SKEWED_SIGN_BOX
+    for step in range(3, 6):
+        now = step * 0.07
+        out = replacer.draw(_shifted_skewed_sign(dx), [_box((x1 + dx, y1, x2 + dx, y2), last_seen=now)], ASSETS, now=now)
+    sign_mask = np.zeros((HEIGHT, WIDTH), np.uint8)
+    cv2.fillConvexPoly(sign_mask, SKEWED_SIGN + np.int32([dx, 0]), 255)
+    inner = cv2.erode(sign_mask, np.ones((9, 9), np.uint8)) > 0
+    assert _is_ad(out)[inner].mean() > 0.98
+
+
+def _luminance(pixels: np.ndarray) -> np.ndarray:
+    return cv2.cvtColor(pixels.reshape(-1, 1, 3), cv2.COLOR_BGR2GRAY).ravel().astype(float)
+
+
+def test_a_dark_post_in_front_of_the_sign_stays_visible_through_the_ad(ads_dir: Path) -> None:
+    image = np.full((HEIGHT, WIDTH, 3), 200, np.uint8)
+    image[50:200, 190:205] = 30  # a dark post across a bright sign
+    out = AdReplacer(ads_dir).draw(image, [_box((100, 50, 300, 200))], ASSETS, now=0.0)
+    post = _luminance(out[60:190, 192:203]).mean()
+    ad = _luminance(out[60:190, 110:170]).mean()
+    assert _is_ad(out[60:190, 110:170]).mean() > 0.99
+    assert post < 0.5 * ad
+
+
+def test_a_flat_sign_under_uneven_light_shows_the_ad_colours(ads_dir: Path) -> None:
+    image = _wall()
+    image[50:200, 100:300] = np.linspace(170, 240, 200, dtype=np.uint8)[None, :, None]  # lit from the right
+    out = AdReplacer(ads_dir).draw(image, [_box((100, 50, 300, 200))], ASSETS, now=0.0)
+    assert _is_ad(out[50:200, 100:300]).mean() > 0.98
