@@ -12,11 +12,11 @@ Milestones: 13:00 faces blurred (Mac) | 14:00 owner + signs/plates | 14:45 voice
 | 6b | Identity re-check: 3 strikes before revoking | merged 12:11 | 11:57–12:10 | wp6b-identity-retry | — |
 | 5 | Objects: YOLOE-26n and NCNN export | merged 11:59; wired into pipeline 12:01 | 11:52–11:59 | wp5-objects | — |
 | 3 | Touch app UI | merged 11:42 | 11:38–11:42 | wp3-ui | — |
-| 12 | Faces at an angle: rotation-robust YuNet | running since 12:21 (40 min box) | 12:21–13:00 | wp12-rotated-faces | — |
+| 12 | Faces at an angle: rotation-robust YuNet | merged 12:44 | 12:21–12:43 | wp12-rotated-faces | Pi timing of 3 YuNet passes per frame |
 | 13 | Point at a track to blur/unblur; operator highlights | merged 12:31, wired to pipeline.toggle_at | 12:21–12:28 | wp13-point-ui | lead: try it live |
-| 14 | Voice: show_all ("unblur everything"), blur/unblur select things | running since 12:21 (40 min box) | 12:21–13:00 | wp14-voice-show-all | — |
-| 15 | Remember unblurred people across track changes (session memory, by face) | running since 12:40 (35 min box) | 12:40–13:15 | wp15-remember-people | — |
-| 16 | Street signs: only street-name signs blur; stop, one-way and other traffic signs don't | queued, next free slot (30 min box) | — | wp16-street-name-signs | slot (3 running) |
+| 14 | Voice: show_all ("unblur everything"), blur/unblur select things | merged 12:53 as PARTIAL: 40/42 live, 2 commands flaky | 12:21–12:52 | wp14-voice-show-all | 'blur her again', 'unblur the guy' sometimes wrong |
+| 15 | Remember unblurred people across track changes (session memory, by face) | merged 12:47 | 12:40–12:47 | wp15-remember-people | — |
+| 16 | Street signs: only street-name signs blur; stop, one-way and other traffic signs don't | running since 12:54 (30 min box) | 12:54–13:25 | wp16-street-name-signs | — |
 | 8 | Integration (orchestrator) | all threads wired 12:03; live voice test pending | 12:03– | main | lead: hold T and speak |
 | 9 | Pi port (orchestrator + lead) | queued | 14:45–15:30 | main | needs WP8, the Pi |
 | 10 | Leak review (read-only) | queued | 15:30–16:00 | — | needs WP9 |
