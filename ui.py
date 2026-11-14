@@ -15,6 +15,12 @@ import pygame
 import config
 from contracts import CensoredFrame
 
+_REC_COLOR = (220, 0, 0)
+_REC_TEXT_COLOR = (255, 255, 255)
+_REC_DOT_CENTER = (20, 20)
+_REC_DOT_RADIUS = 8
+_REC_FONT_SIZE = 28
+
 
 @dataclass(frozen=True)
 class UiStatus:
@@ -49,15 +55,20 @@ def run(
     screen = pygame.display.set_mode((config.FRAME_WIDTH, config.FRAME_HEIGHT), flags)
     pygame.display.set_caption("privacy-cam")
     clock = pygame.time.Clock()
+    font = pygame.font.Font(None, _REC_FONT_SIZE)
+    record_key = pygame.key.key_code(config.KEY_RECORD)
 
     drawn = 0
     try:
         while max_frames is None or drawn < max_frames:
-            if _quit_requested():
+            if _handle_events(callbacks, record_key):
                 break
             frame = get_frame()
             if frame is not None:
                 screen.blit(_to_surface(frame), (0, 0))
+            status = get_status()
+            if status.recording:
+                _draw_recording(screen, font, status.recording_s)
             pygame.display.flip()
             drawn += 1
             clock.tick(config.FPS)
@@ -65,13 +76,29 @@ def run(
         pygame.quit()
 
 
-def _quit_requested() -> bool:
+def _handle_events(callbacks: UiCallbacks, record_key: int) -> bool:
+    """Run the key callbacks; True when the app should quit."""
     for event in pygame.event.get():
         if event.type == pygame.QUIT:
             return True
         if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
             return True
+        if event.type == pygame.KEYDOWN and event.key == record_key:
+            callbacks.on_record_toggle()
     return False
+
+
+def _draw_recording(screen: pygame.Surface, font: pygame.font.Font, recording_s: float) -> None:
+    """Red REC dot and mm:ss in the top-left corner."""
+    pygame.draw.circle(screen, _REC_COLOR, _REC_DOT_CENTER, _REC_DOT_RADIUS)
+    text = font.render(_format_mm_ss(recording_s), True, _REC_TEXT_COLOR)
+    x, y = _REC_DOT_CENTER
+    screen.blit(text, (x + _REC_DOT_RADIUS + 6, y - text.get_height() // 2))
+
+
+def _format_mm_ss(seconds: float) -> str:
+    minutes, secs = divmod(int(max(0.0, seconds)), 60)
+    return f"{minutes:02d}:{secs:02d}"
 
 
 def _to_surface(frame: CensoredFrame) -> pygame.Surface:
