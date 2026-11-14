@@ -22,6 +22,7 @@ Milestones: 13:00 faces blurred (Mac) | 14:00 owner + signs/plates | 14:45 voice
 | 19 | Stop sign still blurred (generic sign prompt); far street-name sign missed | merged 13:33; far blue sign still missed on the Mac | 13:21–13:32 | wp19-sign-precision | lead: one-way distractor vs far street sign |
 | 20 | Live ad replacement, vision: ad prompts, corner fit and warp (vision/replace.py), NCNN re-export | merged 14:55; tested on synthetic posters only | 14:41–14:52 | wp20-ad-replace | lead: images in assets/ads/, try a real poster |
 | 21 | Live ad replacement, voice and UI: set_replacement tool handler, prompt, key A | merged 14:55; live check 46/48 | 14:41–14:54 | wp21-ad-voice-ui | no on-screen Ad button (Pi: voice only) |
+| 22 | Replaced ads too jittery: one drawing per sign, state by position, motion filter | merged; lead to re-watch | 15:07– | wp22-ad-smooth | lead: re-watch ad.mp4 |
 | 8 | Integration (orchestrator) | all threads wired 12:03; live voice test pending | 12:03– | main | lead: hold T and speak |
 | 9 | Pi port (orchestrator + lead) | queued | 14:45–15:30 | main | needs WP8, the Pi |
 | 10 | Leak review (read-only) | queued | 15:30–16:00 | — | needs WP9 |
