@@ -8,7 +8,7 @@ from __future__ import annotations
 import threading
 from dataclasses import asdict, dataclass, field
 from types import MappingProxyType
-from typing import Any, Literal, Mapping
+from typing import Any, Iterable, Literal, Mapping
 
 import numpy as np
 
@@ -72,6 +72,17 @@ class BufferedFrame:
 
 
 @dataclass(frozen=True)
+class Highlight:
+    """One track the operator can point at on the preview. Never drawn into a recording."""
+
+    id: str
+    label: str
+    xyxy: tuple[int, int, int, int]  # frame pixels, unpadded
+    state: Action  # what the frame shows for it right now
+    is_owner: bool = False
+
+
+@dataclass(frozen=True)
 class CensoredFrame:
     """The only frame type the preview and the recorder accept.
 
@@ -81,6 +92,8 @@ class CensoredFrame:
     image: np.ndarray  # BGR, already pixelated
     index: int
     fail_closed: bool  # True when the whole frame was pixelated (watchdog, panic, error)
+    # Operator highlights for the preview only (Never-leaks rule 9); the recorder writes `image` alone.
+    highlights: tuple[Highlight, ...] = ()
 
 
 # --- policy ----------------------------------------------------------------
@@ -150,6 +163,19 @@ class Policy:
     def set_panic(self, on: bool) -> None:
         with self._lock:
             self._panic = bool(on)
+
+    def show_all(self, face_track_ids: Iterable[str]) -> None:
+        """Unblur everything in view: every object class, and the given people one by one.
+
+        The face class itself stays "blur", so anyone who arrives later starts blurred.
+        Also turns panic off.
+        """
+        with self._lock:
+            for label in OBJECT_CLASSES:
+                self._class_rules[label] = "show"
+            for track_id in face_track_ids:
+                self._track_overrides[track_id] = "show"
+            self._panic = False
 
     def _clear_overrides(self, id_prefix: str) -> None:
         for track_id in [t for t in self._track_overrides if t.startswith(f"{id_prefix}#")]:
@@ -248,6 +274,13 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "name": "clear_panic",
         "description": "Panic off: go back to the normal blur rules.",
+        "parameters": _NO_ARGUMENTS,
+    },
+    {
+        "name": "show_all",
+        "description": "Unblur everything in view right now: every known object class and every "
+        "person currently in the scene. People who arrive later still start blurred. Also turns "
+        "panic off. Only for an explicit request to unblur or show everything.",
         "parameters": _NO_ARGUMENTS,
     },
 ]

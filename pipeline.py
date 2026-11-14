@@ -20,7 +20,9 @@ import numpy as np
 
 import config
 from capture import CaptureThread, FrameSource, RingBuffer
-from contracts import EMPTY_SCENE, FACE, Action, BufferedFrame, CensoredFrame, Policy, PolicySnapshot, Scene, TrackedBox
+from contracts import (
+    EMPTY_SCENE, FACE, Action, BufferedFrame, CensoredFrame, Highlight, Policy, PolicySnapshot, Scene, TrackedBox,
+)
 from recorder import Recorder
 from vision import policy as policy_rules
 from vision import render
@@ -87,6 +89,24 @@ class Pipeline(threading.Thread):
     def enroll_owner(self) -> None:
         """Make the largest confident face in the next frame the owner. Safe from any thread."""
         self._enroll_requested.set()
+
+    def toggle_at(self, x: int, y: int) -> str | None:
+        """The operator pointed at frame pixel (x, y): flip blur/show for the track shown there.
+
+        Works on the frame currently on screen. Returns the track id, or None when
+        nothing pointable is there (including while the whole frame is pixelated).
+        """
+        shown = self.latest()
+        if shown is None:
+            return None
+        under_pointer = [h for h in shown.highlights if h.xyxy[0] <= x <= h.xyxy[2] and h.xyxy[1] <= y <= h.xyxy[3]]
+        if not under_pointer:
+            return None
+        target = min(under_pointer, key=lambda h: (h.xyxy[2] - h.xyxy[0]) * (h.xyxy[3] - h.xyxy[1]))
+        action: Action = "blur" if target.state == "show" else "show"
+        self._policy.set_track_override(target.id, action)
+        log.info("pointed at %s (%s): %s", target.id, target.label, action)
+        return target.id
 
     @property
     def owner_enrolled(self) -> bool:
@@ -233,9 +253,20 @@ class Pipeline(threading.Thread):
         log.info("owner enrolled from %s", largest.id)
 
     def _censor(self, frame: BufferedFrame) -> CensoredFrame:
-        return render.censor(
-            frame, self._policy.snapshot(), self._decide, self._watchdog.tripped(time.monotonic())
-        )
+        policy = self._policy.snapshot()
+        censored = render.censor(frame, policy, self._decide, self._watchdog.tripped(time.monotonic()))
+        if censored.fail_closed:
+            return censored
+        return dataclasses.replace(censored, highlights=self._highlights(frame, policy))
+
+    def _highlights(self, frame: BufferedFrame, policy: PolicySnapshot) -> tuple[Highlight, ...]:
+        """What the operator can point at: objects and confident faces, one entry per track."""
+        by_id = {
+            box.id: Highlight(box.id, box.label, box.xyxy, self._decide(box, policy), box.is_owner)
+            for box in frame.boxes
+            if box.label != FACE or box.conf >= config.SCENE_MIN_CONF
+        }
+        return tuple(by_id.values())
 
     def _decide(self, box: TrackedBox, policy: PolicySnapshot) -> Action:
         """policy.decide, except that an owner mark is void once its track failed the ID re-check.

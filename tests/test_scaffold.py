@@ -68,6 +68,16 @@ def test_blurring_faces_clears_face_overrides_only() -> None:
     assert policy.snapshot().track_overrides == {"obj#3": "show"}
 
 
+def test_show_all_unblurs_objects_and_the_given_people_but_not_the_face_class() -> None:
+    policy = Policy()
+    policy.set_panic(True)
+    policy.show_all(["face#2", "face#7"])
+    shown = policy.snapshot()
+    assert shown.class_rules == {"face": "blur", **{label: "show" for label in contracts.OBJECT_CLASSES}}
+    assert shown.track_overrides == {"face#2": "show", "face#7": "show"}
+    assert shown.panic is False
+
+
 def test_snapshot_does_not_follow_later_changes() -> None:
     policy = Policy()
     before = policy.snapshot()
@@ -90,8 +100,8 @@ def test_scene_dict_matches_the_brief() -> None:
     }
 
 
-def test_the_five_tools() -> None:
-    assert contracts.TOOL_NAMES == ("get_scene", "set_class_rule", "set_track", "blur_all", "clear_panic")
+def test_the_tools() -> None:
+    assert contracts.TOOL_NAMES == ("get_scene", "set_class_rule", "set_track", "blur_all", "clear_panic", "show_all")
     by_name = {schema["name"]: schema for schema in contracts.TOOL_SCHEMAS}
     assert by_name["set_class_rule"]["parameters"]["properties"]["label"]["enum"] == list(KNOWN_CLASSES)
     assert by_name["set_track"]["parameters"]["required"] == ["track_id", "action"]
