@@ -19,7 +19,7 @@ Milestones: 13:00 faces blurred (Mac) | 14:00 owner + signs/plates | 14:45 voice
 | 16 | Street signs: only street-name signs blur; stop, one-way and other traffic signs don't | merged 13:01; NCNN at 320 finds no signs on the clip | 12:54–13:00 | wp16-street-name-signs | lead: check intersection clip; Pi sign confidence |
 | 17 | Far-away shown faces flip to 'different person' and re-blur | merged 13:19 | 13:05–13:18 | wp17-far-faces | lead: try it live |
 | 18 | Phantom faces and big blurred building areas from the rotated face passes | running since 13:21 (25 min box) | 13:21–13:46 | wp18-rotated-false-faces | — |
-| 19 | Stop sign still blurred (generic sign prompt); far street-name sign missed | running since 13:21 (30 min box) | 13:21–13:51 | wp19-sign-precision | — |
+| 19 | Stop sign still blurred (generic sign prompt); far street-name sign missed | merged 13:33; far blue sign still missed on the Mac | 13:21–13:32 | wp19-sign-precision | lead: one-way distractor vs far street sign |
 | 8 | Integration (orchestrator) | all threads wired 12:03; live voice test pending | 12:03– | main | lead: hold T and speak |
 | 9 | Pi port (orchestrator + lead) | queued | 14:45–15:30 | main | needs WP8, the Pi |
 | 10 | Leak review (read-only) | queued | 15:30–16:00 | — | needs WP9 |

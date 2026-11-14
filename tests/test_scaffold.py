@@ -132,7 +132,9 @@ def test_config_profiles(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("PRIVACY_CAM_PROFILE", "mac")
         mac = importlib.reload(config)
         assert (mac.YUNET_INPUT_SIZE, mac.YOLOE_RUNTIME, mac.YOLOE_DEVICE, mac.YOLOE_IMGSZ) == ((640, 480), "pytorch", "mps", 640)
-        assert (mac.FPS, mac.DELAY_BUFFER_FRAMES, mac.BACKFILL_FRAMES, mac.PIXEL_BLOCK) == (15, 15, 10, 16)
+        # a third of a second of delay (the lead's choice), and backfill never reaches past the buffer
+        assert (mac.FPS, mac.DELAY_BUFFER_FRAMES, mac.BACKFILL_FRAMES, mac.PIXEL_BLOCK) == (15, 5, 4, 16)
+        assert mac.BACKFILL_FRAMES < mac.DELAY_BUFFER_FRAMES
         assert mac.YOLOE_CLASSES == contracts.OBJECT_CLASSES
 
         monkeypatch.setenv("PRIVACY_CAM_PROFILE", "laptop")
