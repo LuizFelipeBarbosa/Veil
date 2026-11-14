@@ -1,4 +1,4 @@
-"""WP6: owner match and ID-swap check.
+"""WP6: owner match and ID-swap check. WP15: unblurred people are remembered for the session.
 
 Unit tests use a fake embedder: a face row's first value names a person, and each
 person has a fixed vector. Clip tests use real YuNet + SFace on recordings from the
@@ -16,7 +16,7 @@ import pytest
 
 import config
 from contracts import Policy, TrackedBox
-from vision.identity import OwnerIdentity
+from vision.identity import OwnerIdentity, _RememberedPeople
 from vision.policy import decide
 
 OWNER, TWIN, STRANGER, OTHER, BROKEN = 0, 1, 2, 3, 4
@@ -200,19 +200,6 @@ def test_swapped_show_override_is_cleared_within_one_interval_and_not_before() -
     assert decide(box, policy.snapshot()) == "blur"
 
 
-def test_returning_person_under_a_new_track_id_is_blurred() -> None:
-    identity, _ = _identity()
-    policy = Policy()
-    _owners(identity, {"face#7": STRANGER}, policy, 0.0)
-    policy.set_track_override("face#7", "show")
-    now = _run(identity, policy, {"face#7": STRANGER}, FRAME_S, 1.0)
-    now = _run(identity, policy, {}, now, 3.0)  # left the frame
-    box = _face("face#9", STRANGER)
-    identity.update(IMAGE, [box], policy, now)
-    assert box.is_owner is False
-    assert decide(box, policy.snapshot()) == "blur"
-
-
 def test_override_reference_is_forgotten_when_the_override_goes() -> None:
     identity, _ = _identity()
     policy = Policy()
@@ -242,6 +229,181 @@ def test_object_overrides_are_untouched() -> None:
     policy.set_track_override("obj#3", "show")
     _run(identity, policy, {"face#1": STRANGER}, 0.0, 2.0)
     assert policy.snapshot().track_overrides == {"obj#3": "show"}
+
+
+# --- remembered people (WP15; replaces the Brief's rule 7) ---
+
+
+def _overrides(policy: Policy) -> dict[str, str]:
+    return dict(policy.snapshot().track_overrides)
+
+
+def _unblur_then_leave(identity: OwnerIdentity, policy: Policy, track_id: str, person: int, start: float) -> float:
+    """The person is unblurred on track_id, stays a second, then leaves the frame for a second."""
+    _owners(identity, {track_id: person}, policy, start)
+    policy.set_track_override(track_id, "show")
+    now = _run(identity, policy, {track_id: person}, start + FRAME_S, start + 1.0)
+    return _run(identity, policy, {}, now, now + 1.0)
+
+
+def test_returning_person_under_a_new_track_id_is_shown_and_nobody_else() -> None:
+    identity, _ = _identity()
+    policy = Policy()
+    now = _unblur_then_leave(identity, policy, "face#1", STRANGER, 0.0)
+    boxes = [_face("face#5", STRANGER), _face("face#6", OTHER)]
+    identity.update(IMAGE, boxes, policy, now)  # first frame of both new tracks
+    assert _overrides(policy) == {"face#1": "show", "face#5": "show"}
+    assert [decide(box, policy.snapshot()) for box in boxes] == ["show", "blur"]
+    assert not any(box.is_owner for box in boxes)
+    _run(identity, policy, {"face#5": STRANGER, "face#6": OTHER}, now + FRAME_S, now + 4.0)
+    assert _overrides(policy) == {"face#1": "show", "face#5": "show"}
+
+
+@pytest.mark.parametrize("owner_in_view", [False, True])
+def test_blurry_first_frames_of_a_returning_person_are_retried(owner_in_view: bool) -> None:
+    identity, _ = _identity(enroll=owner_in_view)
+    policy = Policy()
+    now = _unblur_then_leave(identity, policy, "face#1", STRANGER, 0.0)
+    owner = {"face#9": OWNER} if owner_in_view else {}
+    _owners(identity, {**owner, "face#5": BROKEN}, policy, now)  # embedding fails
+    _owners(identity, {**owner, "face#5": OTHER}, policy, now + FRAME_S)  # motion blur: looks like nobody known
+    assert "face#5" not in _overrides(policy)
+    _owners(identity, {**owner, "face#5": STRANGER}, policy, now + 2 * FRAME_S)
+    assert _overrides(policy)["face#5"] == "show"
+
+
+def test_a_new_track_is_only_matched_while_it_is_new() -> None:
+    identity, _ = _identity(enroll=False)
+    policy = Policy()
+    now = _unblur_then_leave(identity, policy, "face#1", STRANGER, 0.0)
+    now = _run(identity, policy, {"face#5": OTHER}, now, now + 0.6)  # past the retry window
+    _run(identity, policy, {"face#5": STRANGER}, now, now + 3.0)
+    assert "face#5" not in _overrides(policy)
+
+
+def test_blurring_a_remembered_person_forgets_them() -> None:
+    identity, _ = _identity()
+    policy = Policy()
+    now = _unblur_then_leave(identity, policy, "face#1", STRANGER, 0.0)
+    _owners(identity, {"face#5": STRANGER}, policy, now)
+    assert _overrides(policy)["face#5"] == "show"
+    policy.set_track_override("face#5", "blur")  # "blur her again"
+    now = _run(identity, policy, {"face#5": STRANGER}, now + FRAME_S, now + 0.5)
+    now = _run(identity, policy, {}, now, now + 1.0)
+    _run(identity, policy, {"face#8": STRANGER}, now, now + 3.0)
+    assert "face#8" not in _overrides(policy)
+
+
+def test_blurring_all_faces_forgets_everyone_in_the_same_update() -> None:
+    identity, _ = _identity()
+    policy = Policy()
+    now = _unblur_then_leave(identity, policy, "face#1", STRANGER, 0.0)
+    now = _unblur_then_leave(identity, policy, "face#2", OTHER, now)
+    policy.set_class_rule("face", "blur")  # bumps face_reset_count and clears face overrides
+    _owners(identity, {"face#5": STRANGER, "face#6": OTHER}, policy, now)
+    assert _overrides(policy) == {}
+    _run(identity, policy, {"face#5": STRANGER, "face#6": OTHER}, now + FRAME_S, now + 3.0)
+    assert _overrides(policy) == {}
+    now = _unblur_then_leave(identity, policy, "face#7", OTHER, now + 3.0)  # remembering works again
+    _owners(identity, {"face#8": OTHER}, policy, now)
+    assert _overrides(policy) == {"face#7": "show", "face#8": "show"}
+
+
+def test_re_enrolling_the_owner_keeps_remembered_people() -> None:
+    identity, _ = _identity()
+    policy = Policy()
+    now = _unblur_then_leave(identity, policy, "face#1", STRANGER, 0.0)
+    identity.enroll(IMAGE, _row(OWNER))
+    _owners(identity, {"face#5": STRANGER}, policy, now)
+    assert _overrides(policy)["face#5"] == "show"
+
+
+def test_id_swap_on_a_re_shown_track_is_revoked_and_the_person_stays_remembered() -> None:
+    identity, _ = _identity()
+    policy = Policy()
+    start = _unblur_then_leave(identity, policy, "face#1", STRANGER, 0.0)
+    _owners(identity, {"face#5": STRANGER}, policy, start)
+    assert _overrides(policy)["face#5"] == "show"
+    _owners(identity, {"face#5": OTHER}, policy, start + 0.6)  # the tracker hands face#5 to someone else
+    first_failure = start + 1.05  # the next scheduled re-check
+    for i in range(3):
+        assert _overrides(policy)["face#5"] == "show"
+        _owners(identity, {"face#5": OTHER}, policy, first_failure + i * FRAME_S)
+    assert "face#5" not in _overrides(policy)  # revoked on the third failed frame
+    now = _run(identity, policy, {"face#5": OTHER}, first_failure + 3 * FRAME_S, start + 4.0)
+    assert "face#5" not in _overrides(policy)  # the person who swapped in is not re-shown
+    _run(identity, policy, {"face#5": STRANGER}, now, now + 2.0)
+    assert "face#5" not in _overrides(policy)  # a revoked track is not re-shown automatically
+    _owners(identity, {"face#5": OTHER, "face#9": STRANGER}, policy, now + 2.0)
+    assert _overrides(policy) == {"face#1": "show", "face#9": "show"}  # the real person, on a new track
+
+
+def test_held_over_boxes_are_never_matched_to_a_remembered_person() -> None:
+    identity, embedder = _identity()
+    policy = Policy()
+    now = _unblur_then_leave(identity, policy, "face#1", STRANGER, 0.0)
+    calls = len(embedder.calls)
+    now = _run(identity, policy, {"face#5": None}, now, now + 1.0)
+    assert "face#5" not in _overrides(policy)
+    assert len(embedder.calls) == calls
+    _owners(identity, {"face#5": STRANGER}, policy, now)  # its first fresh face row
+    assert _overrides(policy)["face#5"] == "show"
+
+
+def test_embedding_errors_never_unblur() -> None:
+    identity, _ = _identity()
+    policy = Policy()
+    now = _unblur_then_leave(identity, policy, "face#1", STRANGER, 0.0)
+    _run(identity, policy, {"face#5": BROKEN}, now, now + 3.0)
+    assert "face#5" not in _overrides(policy)
+
+
+def test_a_track_with_its_own_blur_override_is_not_re_shown() -> None:
+    identity, _ = _identity()
+    policy = Policy()
+    now = _unblur_then_leave(identity, policy, "face#1", STRANGER, 0.0)
+    policy.set_track_override("face#5", "blur")
+    _run(identity, policy, {"face#5": STRANGER}, now, now + 2.0)
+    assert _overrides(policy)["face#5"] == "blur"
+
+
+def test_remembered_people_are_capped_and_the_oldest_is_dropped() -> None:
+    people = _RememberedPeople()
+    faces = list(np.eye(20, dtype=np.float32))
+    for face in faces[:17]:
+        people.add(face)
+    people.add(faces[16])  # already remembered: not added twice
+    assert len(people) == 16
+    assert people.match(faces[0]) is None
+    assert all(people.match(face) is not None for face in faces[1:17])
+    assert people.match(faces[17]) is None
+
+
+def test_remembered_people_add_no_steady_state_embeddings(monkeypatch) -> None:
+    monkeypatch.setattr(config, "ID_RECHECK_S", 1.0)
+    times: dict[int, list[float]] = {OWNER: [], STRANGER: [], OTHER: []}
+    now = 0.0
+
+    def embed(image: np.ndarray, face_row: np.ndarray) -> np.ndarray:
+        times[int(face_row[0])].append(now)
+        return PEOPLE[int(face_row[0])]
+
+    identity = OwnerIdentity(embed=embed)
+    identity.enroll(IMAGE, _row(OWNER))
+    policy = Policy()
+    start = _unblur_then_leave(identity, policy, "face#1", STRANGER, 0.0)
+    for track_times in times.values():
+        track_times.clear()
+    for i in range(60):  # 4 s at 15 FPS: the owner, a remembered person and a stranger
+        now = start + i * FRAME_S
+        _owners(identity, {"face#2": OWNER, "face#5": STRANGER, "face#6": OTHER}, policy, now)
+    assert _overrides(policy) == {"face#1": "show", "face#5": "show"}
+    # The new track that matches nobody remembered is retried for 0.5 s (8 frames), like the owner retry.
+    assert len([t for t in times[OTHER] if t < start + 0.5]) == 8
+    for track_times in times.values():
+        steady = [t for t in track_times if t >= start + 0.5]
+        assert 3 <= len(steady) <= 4
+        assert all(b - a >= 1.0 - 1e-9 for a, b in zip(steady, steady[1:]))
 
 
 # --- fail closed ---
@@ -515,6 +677,37 @@ def test_clip_swapped_face_clears_the_override(clip: Path) -> None:
     assert policy.snapshot().track_overrides == {"face#7": "show"}  # two strikes so far
     frame(person_b, 2.0 + 2 / 15)
     assert policy.snapshot().track_overrides == {}
+
+
+@needs_models
+def test_clip_remembered_person_is_shown_under_a_new_track_id() -> None:
+    frames = _clip_faces(CROSSING_CLIP)
+    frames = [(image, rows[rows[:, 14] >= 0.8]) for image, rows in frames]
+    frames = [(image, rows) for image, rows in frames if len(rows) >= 2]
+    if len(frames) < 2:
+        pytest.skip("crossing.mov has fewer than two frames with two confident faces")
+    first_image, first_rows = frames[0]
+    later_image, later_rows = frames[-1]
+    # rows are not ordered by person: follow the first face by position through every frame
+    person = first_rows[0]
+    for _, rows in frames[1:]:
+        nearest = int(np.argmin(np.abs(rows[:, 0] - person[0]) + np.abs(rows[:, 1] - person[1])))
+        person = rows[nearest]
+    other = later_rows[1 if nearest == 0 else 0]
+    identity = _sface()
+    policy = Policy()
+
+    def frame(image: np.ndarray, rows: dict[str, np.ndarray], now: float) -> None:
+        boxes = [TrackedBox(id=track_id, label="face", xyxy=(0, 0, 1, 1), conf=1.0, frame_index=0, last_seen=now,
+                            face_row=row) for track_id, row in rows.items()]
+        identity.update(image, boxes, policy, now)
+
+    frame(first_image, {"face#1": first_rows[0]}, 0.0)
+    policy.set_track_override("face#1", "show")
+    frame(first_image, {"face#1": first_rows[0]}, 0.1)  # unblurred: remembered
+    frame(later_image, {}, 1.0)  # left the frame
+    frame(later_image, {"face#5": person, "face#6": other}, 2.0)  # several seconds later in the clip
+    assert dict(policy.snapshot().track_overrides) == {"face#1": "show", "face#5": "show"}
 
 
 @needs_models

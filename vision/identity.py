@@ -1,4 +1,4 @@
-"""SFace owner match and ID-swap re-checks (WP6)."""
+"""SFace owner match, ID-swap re-checks (WP6) and remembered unblurred people (WP15)."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ from contracts import FACE, Policy, TrackedBox
 
 _MAX_STRIKES = 3  # consecutive failed per-frame checks before the owner or a "show" override is revoked
 _RETRY_WINDOW_S = 0.5  # how long failed checks are retried every frame before giving up
+_MAX_REMEMBERED = 16  # unblurred people remembered for the session; the oldest is dropped beyond this
 
 # (raw BGR image, YuNet face row) -> SFace feature. Injectable so tests need no real faces.
 Embedder = Callable[[np.ndarray, np.ndarray], np.ndarray]
@@ -53,18 +54,61 @@ class _Track:
     embedding: np.ndarray | None = None  # unit length; None when the last embedding failed
     owner_score: float | None = None  # cosine with the owner while this track counts as an owner match
     retry_until: float = float("-inf")  # a new track that missed the owner is checked every frame until then
+    # A new track that matched no remembered person is checked every frame until then.
+    # None until its first fresh embedding; -inf once it may no longer be re-shown automatically.
+    reshow_until: float | None = None
     owner_strikes: _Strikes = field(default_factory=_Strikes)
     show_strikes: _Strikes = field(default_factory=_Strikes)
 
     def check_due(self, now: float) -> bool:
         if self.checked_at is None or self.owner_strikes.pending or self.show_strikes.pending:
             return True
-        return now < self.retry_until or now - self.checked_at >= config.ID_RECHECK_S
+        return now < self.retry_until or self.may_reshow(now) or now - self.checked_at >= config.ID_RECHECK_S
+
+    def may_reshow(self, now: float) -> bool:
+        """True while this new track may still be matched to a remembered person."""
+        return self.reshow_until is None or now < self.reshow_until
+
+
+class _RememberedPeople:
+    """Unit embeddings of the people who were unblurred this session, oldest first. Memory only."""
+
+    def __init__(self) -> None:
+        self._embeddings: list[np.ndarray] = []
+
+    def __len__(self) -> int:
+        return len(self._embeddings)
+
+    def add(self, embedding: np.ndarray) -> None:
+        if self.match(embedding) is not None:
+            return
+        self._embeddings.append(embedding)
+        del self._embeddings[:-_MAX_REMEMBERED]
+
+    def match(self, embedding: np.ndarray | None) -> np.ndarray | None:
+        """The best remembered embedding at or above the match threshold, or None."""
+        if embedding is None:
+            return None
+        best, best_score = None, -1.0
+        for remembered in self._embeddings:
+            score = _cosine(remembered, embedding)
+            if score >= config.SFACE_COSINE_MATCH and score > best_score:
+                best, best_score = remembered, score
+        return best
+
+    def forget_matching(self, embedding: np.ndarray) -> None:
+        self._embeddings = [e for e in self._embeddings if not _same_person(e, embedding)]
+
+    def clear(self) -> None:
+        self._embeddings.clear()
 
 
 class OwnerIdentity:
     """Remembers the owner's embedding and the embedding of every unblurred person.
 
+    An unblurred person stays unblurred for the session: a later face track that
+    matches them gets a "show" override again (this replaces the Brief's Never-leaks
+    rule 7, by the lead's request), until they are blurred again or all faces are.
     Embeddings live in memory only; nothing here writes an image or an embedding to disk.
     """
 
@@ -74,6 +118,8 @@ class OwnerIdentity:
         self._owner_track: str | None = None
         self._tracks: dict[str, _Track] = {}  # face tracks in the latest frame
         self._show_refs: dict[str, np.ndarray] = {}  # embedding saved when a "show" override was first seen
+        self._people = _RememberedPeople()
+        self._face_reset_count = 0  # policy face_reset_count seen on the previous update
 
     @property
     def enrolled(self) -> bool:
@@ -92,8 +138,16 @@ class OwnerIdentity:
         following frame with a fresh face row; the identity is revoked after
         _MAX_STRIKES failures in a row, or when nothing matched for _RETRY_WINDOW_S.
         A revoked override is removed from the policy, so a swapped ID blurs again
-        (Never-leaks rule 6).
+        (Never-leaks rule 6); the revoked track is not re-shown automatically.
+
+        A new face track without an override that matches a remembered person gets a
+        "show" override, checked against that person from then on.
         """
+        reset_count = policy.snapshot().face_reset_count
+        if reset_count != self._face_reset_count:  # "blur all faces": forget everyone first
+            self._people.clear()
+            self._face_reset_count = reset_count
+
         faces = [box for box in boxes if box.label == FACE]
         for box in boxes:
             box.is_owner = False
@@ -108,6 +162,8 @@ class OwnerIdentity:
             elif box.id == self._owner_track and track.owner_strikes.expired(now):
                 _revoke_owner(track)
 
+        self._forget_blurred(policy)
+        self._reshow_remembered(faces, checked, policy, now)
         self._check_show_overrides(faces, checked, policy, now)
         owner_box = self._mark_owner(faces)
         if owner_box is not None and owner_box.face_row is not None:
@@ -139,6 +195,39 @@ class OwnerIdentity:
             if first_check:
                 track.retry_until = now + _RETRY_WINDOW_S
 
+    def _forget_blurred(self, policy: Policy) -> None:
+        """A person whose track is blurred on request is not re-shown under a later track id."""
+        for track_id, action in policy.snapshot().track_overrides.items():
+            if action != "blur":
+                continue
+            track = self._tracks.get(track_id)
+            for embedding in (self._show_refs.get(track_id), track.embedding if track else None):
+                if embedding is not None:
+                    self._people.forget_matching(embedding)
+
+    def _reshow_remembered(self, faces: list[TrackedBox], checked: set[str], policy: Policy, now: float) -> None:
+        """Give a new track a "show" override when its fresh embedding matches a remembered person."""
+        snapshot = policy.snapshot()
+        if snapshot.face_reset_count != self._face_reset_count:
+            return  # all faces were blurred during this update: forget everyone on the next one first
+        for box in faces:
+            track = self._tracks[box.id]
+            if box.id in snapshot.track_overrides:
+                track.reshow_until = float("-inf")  # it has its own choice; never touched by this
+                continue
+            if box.id not in checked or not track.may_reshow(now):
+                continue
+            person = self._people.match(track.embedding)
+            if person is not None:
+                policy.set_track_override(box.id, "show")
+                if policy.snapshot().face_reset_count != self._face_reset_count:
+                    policy.clear_track_override(box.id)  # "blur all faces" landed meanwhile: fail closed
+                    return
+                self._show_refs[box.id] = person  # the swap check compares with the remembered face
+                track.reshow_until = float("-inf")
+            elif track.reshow_until is None:  # first sight missed: retry while anyone is remembered
+                track.reshow_until = now + _RETRY_WINDOW_S if self._people else float("-inf")
+
     def _check_show_overrides(self, faces: list[TrackedBox], checked: set[str], policy: Policy, now: float) -> None:
         overrides = policy.snapshot().track_overrides
         shown = {track_id for track_id, action in overrides.items() if action == "show"}
@@ -154,6 +243,7 @@ class OwnerIdentity:
                     self._revoke_show(box.id, track, policy)
                 else:
                     self._show_refs[box.id] = track.embedding
+                    self._people.add(track.embedding)
                 continue
             if box.id not in checked:
                 revoke = track.show_strikes.expired(now)
@@ -169,6 +259,7 @@ class OwnerIdentity:
         policy.clear_track_override(track_id)
         self._show_refs.pop(track_id, None)
         track.show_strikes.reset()
+        track.reshow_until = float("-inf")  # this track is somebody else now; the person stays remembered
 
     def _mark_owner(self, faces: list[TrackedBox]) -> TrackedBox | None:
         """The best match at or above the threshold. A box without a fresh face row can only stay owner."""
