@@ -1,4 +1,4 @@
-"""WP20: ad replacement. Synthetic frames and ad images only, made in memory or in tmp_path."""
+"""WP20/WP22: ad replacement and its per-sign smoothing. Synthetic frames and ad images only, made in memory or in tmp_path."""
 
 from __future__ import annotations
 
@@ -19,8 +19,10 @@ AD_COLOR = (0, 200, 255)  # BGR; nothing in the synthetic scenes has it
 ASSETS = {"poster": "ad.png", "billboard": "ad.png"}
 
 
-def _box(xyxy: tuple[int, int, int, int], track_id: str = "obj#1", label: str = "poster") -> TrackedBox:
-    return TrackedBox(id=track_id, label=label, xyxy=xyxy, conf=0.6, frame_index=0, last_seen=0.0)
+def _box(
+    xyxy: tuple[int, int, int, int], track_id: str = "obj#1", label: str = "poster", last_seen: float = 0.0
+) -> TrackedBox:
+    return TrackedBox(id=track_id, label=label, xyxy=xyxy, conf=0.6, frame_index=0, last_seen=last_seen)
 
 
 @pytest.fixture
@@ -53,26 +55,56 @@ def test_list_assets_returns_sorted_image_names_only(tmp_path: Path) -> None:
 # --- drawing ---
 
 
-def test_the_asset_is_warped_onto_a_skewed_sign_inside_its_box(ads_dir: Path) -> None:
+SKEWED_SIGN = np.int32([[220, 130], [430, 160], [420, 330], [210, 300]])
+SKEWED_SIGN_BOX = (200, 120, 440, 340)
+
+
+def _wall_with_skewed_sign() -> np.ndarray:
     image = _wall()
-    sign = np.int32([[220, 130], [430, 160], [420, 330], [210, 300]])
-    cv2.fillConvexPoly(image, sign, (240, 240, 240))
-    cv2.polylines(image, [sign], True, (20, 20, 20), 3)
-    box = (200, 120, 440, 340)
+    cv2.fillConvexPoly(image, SKEWED_SIGN, (240, 240, 240))
+    cv2.polylines(image, [SKEWED_SIGN], True, (20, 20, 20), 3)
+    return image
 
-    out = AdReplacer(ads_dir).draw(image, [_box(box)], ASSETS, now=0.0)
 
+def _assert_ad_on_skewed_sign_only(out: np.ndarray) -> None:
     sign_mask = np.zeros((HEIGHT, WIDTH), np.uint8)
-    cv2.fillConvexPoly(sign_mask, sign, 255)
+    cv2.fillConvexPoly(sign_mask, SKEWED_SIGN, 255)
     inner = cv2.erode(sign_mask, np.ones((9, 9), np.uint8)) > 0
     outer = cv2.dilate(sign_mask, np.ones((9, 9), np.uint8)) > 0
     ad = _is_ad(out)
     assert ad[inner].mean() > 0.98  # the sign is covered
-    x1, y1, x2, y2 = box
+    x1, y1, x2, y2 = SKEWED_SIGN_BOX
     in_box_off_sign = np.zeros((HEIGHT, WIDTH), bool)
     in_box_off_sign[y1:y2, x1:x2] = True
     in_box_off_sign &= ~outer
-    assert not ad[in_box_off_sign].any()  # the wall around it inside the box is not: the quad was found
+    assert not ad[in_box_off_sign].any()  # the wall around it inside the box is not: the quad was used
+
+
+def test_the_asset_is_warped_onto_a_skewed_sign_inside_its_box(ads_dir: Path) -> None:
+    out = AdReplacer(ads_dir).draw(_wall_with_skewed_sign(), [_box(SKEWED_SIGN_BOX)], ASSETS, now=0.0)
+    _assert_ad_on_skewed_sign_only(out)
+
+
+def test_the_sign_keeps_its_shape_when_the_quad_search_fails(ads_dir: Path) -> None:
+    replacer = AdReplacer(ads_dir)
+    replacer.draw(_wall_with_skewed_sign(), [_box(SKEWED_SIGN_BOX)], ASSETS, now=0.0)
+    # Next frames: the outline is lost (motion blur, a passer-by), the box is a fresh detection then a held-over one.
+    out = replacer.draw(_wall(), [_box(SKEWED_SIGN_BOX, last_seen=0.07)], ASSETS, now=0.07)
+    _assert_ad_on_skewed_sign_only(out)  # still the quad, not the box rectangle
+    out = replacer.draw(_wall(), [_box(SKEWED_SIGN_BOX, last_seen=0.07)], ASSETS, now=0.14)
+    _assert_ad_on_skewed_sign_only(out)
+
+
+def test_overlapping_boxes_on_one_sign_are_drawn_once(ads_dir: Path) -> None:
+    other_color = (255, 0, 255)
+    cv2.imwrite(str(ads_dir / "other.png"), np.full((150, 200, 3), other_color, dtype=np.uint8))
+    boxes = [
+        _box((100, 50, 300, 200), "obj#1", "poster", last_seen=0.0),
+        _box((104, 46, 296, 205), "obj#2", "billboard", last_seen=0.1),  # the fresher one wins
+    ]
+    out = AdReplacer(ads_dir).draw(_wall(), boxes, {"poster": "ad.png", "billboard": "other.png"}, now=0.1)
+    assert not _is_ad(out).any()
+    assert np.all(out[60:190, 110:290] == other_color)
 
 
 def test_without_a_sign_outline_the_whole_box_is_filled(ads_dir: Path) -> None:
@@ -132,7 +164,8 @@ def _ad_column(out: np.ndarray, row: int) -> float:
     return float(np.argmin(np.abs(values - 128)))
 
 
-def test_smoothing_damps_a_jittering_box(tmp_path: Path) -> None:
+@pytest.mark.parametrize("same_track", [True, False], ids=["same track", "new track id and label every frame"])
+def test_smoothing_damps_a_jittering_box(tmp_path: Path, same_track: bool) -> None:
     gradient = np.zeros((100, 256, 3), np.uint8)
     gradient[:, :, 1] = np.arange(256, dtype=np.uint8)
     cv2.imwrite(str(tmp_path / "ramp.png"), gradient)
@@ -142,9 +175,11 @@ def test_smoothing_damps_a_jittering_box(tmp_path: Path) -> None:
     columns = []
     for step in range(10):
         dx = jitter if step % 2 else -jitter
-        out = replacer.draw(image, [_box((200 + dx, 100, 456 + dx, 300))], {"poster": "ramp.png"}, now=step * 0.07)
+        track_id, label = ("obj#1", "poster") if same_track else (f"obj#{step}", ("poster", "billboard")[step % 2])
+        box = _box((200 + dx, 100, 456 + dx, 300), track_id, label, last_seen=step * 0.07)
+        out = replacer.draw(image, [box], {"poster": "ramp.png", "billboard": "ramp.png"}, now=step * 0.07)
         columns.append(_ad_column(out, 200))
-    # Unsmoothed, the middle of the ramp would move 2 * jitter = 24 px every frame.
+    # Unsmoothed, or reset on every new id, the middle of the ramp would move 2 * jitter = 24 px every frame.
     assert max(abs(a - b) for a, b in zip(columns[3:], columns[4:])) < jitter
 
 
@@ -155,6 +190,30 @@ def test_a_track_not_seen_for_longer_than_the_hold_over_starts_fresh(ads_dir: Pa
     replacer.draw(image, [], ASSETS, now=config.HOLD_OVER_S + 0.1)
     out = replacer.draw(image, [_box((300, 300, 400, 400))], ASSETS, now=config.HOLD_OVER_S + 0.2)
     assert _is_ad(out[300:400, 300:400]).all()  # not dragged from the old position
+
+
+def test_a_steadily_moving_sign_is_followed_without_growing_lag(ads_dir: Path) -> None:
+    image = np.zeros((HEIGHT, WIDTH, 3), np.uint8)  # no edges: the box itself is the measurement
+    replacer = AdReplacer(ads_dir)
+    speed = 6  # px per frame at 15 FPS, a steady pan
+    lags = []
+    for step in range(40):
+        now = step / 15
+        x1 = 50 + speed * step
+        out = replacer.draw(image, [_box((x1, 100, x1 + 200, 250), last_seen=now)], ASSETS, now=now)
+        covered = np.flatnonzero(_is_ad(out[175]))
+        lags.append(x1 + 199 - covered[-1])  # how far the ad's right edge trails the sign's
+    assert max(lags[20:]) <= 3  # caught up: a constant-velocity filter has no steady lag
+    assert lags[-1] <= max(lags[5:15])  # and the lag does not grow
+
+
+def test_a_held_over_box_keeps_its_ad_drawn(ads_dir: Path) -> None:
+    replacer = AdReplacer(ads_dir)
+    image = np.zeros((HEIGHT, WIDTH, 3), np.uint8)
+    replacer.draw(image, [_box((100, 50, 300, 200), last_seen=0.0)], ASSETS, now=0.0)
+    for now in (0.07, 0.14, 0.21, 0.28):  # the detector lost it; the pipeline holds the last box over
+        out = replacer.draw(image, [_box((100, 50, 300, 200), last_seen=0.0)], ASSETS, now=now)
+        assert _is_ad(out[50:200, 100:300]).mean() > 0.99
 
 
 def test_draw_is_cheap(ads_dir: Path) -> None:

@@ -32,8 +32,19 @@ _MIN_EDGE_SUPPORT = 0.3
 _APPROX_EPSILONS = (0.02, 0.04, 0.06)  # of the hull's perimeter, for approxPolyDP; the first that gives 4 corners
 _CANNY_LOW, _CANNY_HIGH = 50, 150
 _MIN_BOX_SIDE = 8  # px; smaller boxes are filled without a corner search
-# Weight of the new corners in the per-track exponential smoothing; 1.0 turns smoothing off.
-_SMOOTHING = 0.4
+# Per-sign alpha-beta filter on the corners: a constant-velocity prediction corrected by the measurement.
+# A found quad is precise (within ~2 px), so it corrects more than the box-derived shape, which jitters
+# with the detector's box (up to ~30 px a frame on the ad clip).
+_QUAD_GAIN = 0.6
+_BOX_GAIN = 0.25
+_VELOCITY_GAIN = 0.15  # share of the residual / dt added to the velocity
+_SHAPE_GAIN = 0.3  # weight of a newly found quad in the sign's box-relative shape
+_COAST_DECAY = 0.7  # velocity kept per frame while the box is a held-over one and no quad is found
+# A box overlapping a sign's last box this much is that sign, whatever its track id or label.
+_MIN_SAME_SIGN_IOU = 0.3
+# A found quad further than this share of the box diagonal (mean corner distance) from the prediction
+# is another outline (a poster inside the billboard, a passer-by) and is ignored.
+_MAX_QUAD_JUMP = 0.12
 _MAX_ASSET_SIDE = 640  # px; assets are shrunk to this on load, which bounds the cache and the warp
 
 
@@ -50,16 +61,31 @@ def list_assets(directory: Path = config.ADS_DIR) -> tuple[str, ...]:
     )
 
 
-class AdReplacer:
-    """Warps an ad image onto each replaced sign, with its corners smoothed per track.
+class _Sign:
+    """One physical sign: its filtered corners and, once a quad was found, its shape relative to the box.
 
-    Keeps only the loaded ad images and each track's corners: never a frame.
+    Matched to boxes by overlap, so a new track id or label for the same sign keeps the state.
+    """
+
+    def __init__(self, box: tuple[int, int, int, int], now: float) -> None:
+        self.box = box  # last box it was matched to (clipped)
+        self.box_seen: float | None = None  # its last_seen: an unchanged one is held over, not a new measurement
+        self.corners: np.ndarray | None = None  # frame px; set by the first update
+        self.velocity = np.zeros((4, 2), np.float32)  # px/s per corner
+        self.shape: np.ndarray | None = None  # corners in box-relative units (0..1), once a quad was found
+        self.updated = now
+
+
+class AdReplacer:
+    """Warps an ad image onto each replaced sign, with its corners filtered per sign.
+
+    Keeps only the loaded ad images and each sign's corners: never a frame.
     """
 
     def __init__(self, directory: Path = config.ADS_DIR) -> None:
         self._directory = directory
         self._assets: dict[str, np.ndarray | None] = {}  # None: missing or unreadable, logged once
-        self._corners: dict[str, tuple[np.ndarray, float]] = {}  # track id -> (smoothed corners, last seen)
+        self._signs: list[_Sign] = []
 
     def draw(
         self, image: np.ndarray, boxes: Sequence[TrackedBox], assets: Mapping[str, str], now: float
@@ -67,22 +93,26 @@ class AdReplacer:
         """A copy of `image` with the asset for each box's label drawn over the sign.
 
         `boxes` are the boxes whose decision is "replace"; `assets` maps label -> file name.
-        A box whose asset is missing or unreadable is left as it is.
+        A box whose asset is missing or unreadable is left as it is. Overlapping boxes on one sign
+        (duplicate tracks, other labels) are drawn once. The drawing stays inside the box.
         """
         out = image.copy()
         height, width = image.shape[:2]
-        for box in boxes:
+        unmatched = list(self._signs)
+        for box in _one_per_sign(boxes):
             asset = self._asset(assets.get(box.label, ""))
-            x1, y1, x2, y2 = _clipped(box.xyxy, width, height)
-            if asset is None or x2 - x1 < 2 or y2 - y1 < 2:
+            xyxy = _clipped(box.xyxy, width, height)
+            if asset is None or xyxy[2] - xyxy[0] < 2 or xyxy[3] - xyxy[1] < 2:
                 continue
-            found = _find_quad(image, (x1, y1, x2, y2))
-            measured = found if found is not None else _box_corners((x1, y1, x2, y2))
-            corners = self._smoothed(box.id, measured, now)
-            _warp_into_box(out, asset, corners, (x1, y1, x2, y2))
-        self._corners = {
-            track_id: state for track_id, state in self._corners.items() if now - state[1] <= config.HOLD_OVER_S
-        }
+            sign = max(unmatched, key=lambda s: _iou(s.box, xyxy), default=None)
+            if sign is None or _iou(sign.box, xyxy) < _MIN_SAME_SIGN_IOU:
+                sign = _Sign(xyxy, now)
+                self._signs.append(sign)
+            else:
+                unmatched.remove(sign)
+            _update(sign, _find_quad(image, xyxy), xyxy, box.last_seen, now)
+            _warp_into_box(out, asset, sign.corners, xyxy)
+        self._signs = [sign for sign in self._signs if now - sign.updated <= config.HOLD_OVER_S]
         return out
 
     def _asset(self, name: str) -> np.ndarray | None:
@@ -106,14 +136,53 @@ class AdReplacer:
             asset = cv2.resize(asset, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
         return asset
 
-    def _smoothed(self, track_id: str, measured: np.ndarray, now: float) -> np.ndarray:
-        previous = self._corners.get(track_id)
-        if previous is None:
-            corners = measured
-        else:
-            corners = _SMOOTHING * measured + (1 - _SMOOTHING) * previous[0]
-        self._corners[track_id] = (corners, now)
-        return corners
+
+def _one_per_sign(boxes: Sequence[TrackedBox]) -> list[TrackedBox]:
+    """Of boxes overlapping one sign, the freshest (then most confident): held-over copies are stale."""
+    kept: list[TrackedBox] = []
+    for box in sorted(boxes, key=lambda b: (b.last_seen, b.conf), reverse=True):
+        if all(_iou(box.xyxy, other.xyxy) < _MIN_SAME_SIGN_IOU for other in kept):
+            kept.append(box)
+    return kept
+
+
+def _update(
+    sign: _Sign, found: np.ndarray | None, xyxy: tuple[int, int, int, int], box_seen: float, now: float
+) -> None:
+    """One alpha-beta step: predict with the velocity, correct with the quad or else the box-relative shape."""
+    origin, size = np.float32(xyxy[:2]), np.float32([xyxy[2] - xyxy[0], xyxy[3] - xyxy[1]])
+    if sign.corners is None:  # a new sign starts where it is measured
+        sign.corners = found if found is not None else _box_corners(xyxy)
+        sign.shape = None if found is None else (found - origin) / size
+        sign.box_seen = box_seen
+        return
+    dt = now - sign.updated
+    predicted = sign.corners + sign.velocity * dt
+    jump = None if found is None else np.linalg.norm(found - predicted, axis=1).mean()
+    if sign.shape is not None and jump is not None and jump > _MAX_QUAD_JUMP * np.linalg.norm(size):
+        found = None  # another outline; a sign without a shape yet takes the first quad it finds
+    if found is not None:
+        measured, gain = found, _QUAD_GAIN
+        relative = (found - origin) / size
+        sign.shape = relative if sign.shape is None else _SHAPE_GAIN * relative + (1 - _SHAPE_GAIN) * sign.shape
+    elif box_seen != sign.box_seen:
+        shape = sign.shape if sign.shape is not None else _box_corners((0, 0, 1, 1))
+        measured, gain = origin + shape * size, _BOX_GAIN
+    else:  # a held-over box and no quad: nothing new, coast on the prediction
+        measured, gain = predicted, 0.0
+        sign.velocity *= _COAST_DECAY
+
+    residual = measured - predicted
+    sign.corners = predicted + gain * residual
+    if dt > 0:
+        sign.velocity += _VELOCITY_GAIN * residual / dt
+    sign.box, sign.box_seen, sign.updated = xyxy, box_seen, now
+
+
+def _grown(xyxy: tuple[int, int, int, int], width: int, height: int) -> tuple[int, int, int, int]:
+    x1, y1, x2, y2 = xyxy
+    margin_x, margin_y = round(_SEARCH_MARGIN * (x2 - x1)), round(_SEARCH_MARGIN * (y2 - y1))
+    return _clipped((x1 - margin_x, y1 - margin_y, x2 + margin_x, y2 + margin_y), width, height)
 
 
 def _clipped(xyxy: tuple[int, int, int, int], width: int, height: int) -> tuple[int, int, int, int]:
@@ -137,10 +206,7 @@ def _find_quad(image: np.ndarray, xyxy: tuple[int, int, int, int]) -> np.ndarray
     box_w, box_h = x2 - x1, y2 - y1
     if min(box_w, box_h) < _MIN_BOX_SIDE:
         return None
-    height, width = image.shape[:2]
-    margin_x, margin_y = round(_SEARCH_MARGIN * box_w), round(_SEARCH_MARGIN * box_h)
-    left, top = max(0, x1 - margin_x), max(0, y1 - margin_y)
-    right, bottom = min(width, x2 + margin_x), min(height, y2 + margin_y)
+    left, top, right, bottom = _grown(xyxy, image.shape[1], image.shape[0])
 
     gray = cv2.cvtColor(image[top:bottom, left:right], cv2.COLOR_BGR2GRAY)
     edges = cv2.dilate(cv2.Canny(gray, _CANNY_LOW, _CANNY_HIGH), None)  # close small gaps in the outline
@@ -199,7 +265,9 @@ def _ordered(points: np.ndarray) -> np.ndarray:
     return np.roll(clockwise, -int(np.argmin(clockwise.sum(axis=1))), axis=0)
 
 
-def _warp_into_box(out: np.ndarray, asset: np.ndarray, corners: np.ndarray, xyxy: tuple[int, int, int, int]) -> None:
+def _warp_into_box(
+    out: np.ndarray, asset: np.ndarray, corners: np.ndarray, xyxy: tuple[int, int, int, int]
+) -> None:
     """Warp `asset` onto `corners`, writing only inside the box. Works on the box-sized region alone."""
     x1, y1, x2, y2 = xyxy
     asset_h, asset_w = asset.shape[:2]
