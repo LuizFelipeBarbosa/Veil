@@ -93,12 +93,14 @@ def test_only_one_owner_when_two_faces_match() -> None:
     assert len(_owners(identity, {"face#1": OWNER, "face#2": OWNER}, Policy(), 0.0)) == 1
 
 
-def test_owner_that_stops_matching_loses_it_at_the_next_recheck() -> None:
+def test_owner_that_stops_matching_loses_it_after_three_failed_checks() -> None:
     identity, _ = _identity()
     policy = Policy()
     assert _owners(identity, {"face#1": OWNER}, policy, 0.0) == ["face#1"]
     assert _owners(identity, {"face#1": STRANGER}, policy, 0.5) == ["face#1"]  # cached until the re-check
-    assert _owners(identity, {"face#1": STRANGER}, policy, 1.0) == []
+    assert _owners(identity, {"face#1": STRANGER}, policy, 1.0) == ["face#1"]  # strike 1
+    assert _owners(identity, {"face#1": STRANGER}, policy, 1.0 + FRAME_S) == ["face#1"]  # strike 2
+    assert _owners(identity, {"face#1": STRANGER}, policy, 1.0 + 2 * FRAME_S) == []  # strike 3
 
 
 def test_held_over_box_is_never_newly_owner_and_is_not_rechecked() -> None:
@@ -183,13 +185,16 @@ def test_swapped_show_override_is_cleared_within_one_interval_and_not_before() -
     policy = Policy()
     _owners(identity, {"face#7": STRANGER}, policy, 0.0)  # embedded at t=0
     policy.set_track_override("face#7", "show")
-    _owners(identity, {"face#7": STRANGER}, policy, 0.1)  # reference saved
-    swap_at = 0.3
-    now = _run(identity, policy, {"face#7": OTHER}, swap_at, 1.0)  # the tracker hands face#7 to someone else
+    _owners(identity, {"face#7": STRANGER}, policy, 0.1)  # reference saved; re-checked (new-track retry window)
+    swap_at = 0.6  # after the new track's 0.5 s retry window
+    now = _run(identity, policy, {"face#7": OTHER}, swap_at, 1.1)  # the tracker hands face#7 to someone else
     assert policy.snapshot().track_overrides == {"face#7": "show"}  # not before the re-check
-    _owners(identity, {"face#7": OTHER}, policy, now)  # first frame at or after t=1.0
+    for _ in range(3):  # first frame at or after t=1.1, then two more per-frame retries
+        assert policy.snapshot().track_overrides == {"face#7": "show"}
+        _owners(identity, {"face#7": OTHER}, policy, now)
+        now += FRAME_S
     assert policy.snapshot().track_overrides == {}
-    assert now - swap_at <= config.ID_RECHECK_S
+    assert now - FRAME_S - swap_at <= config.ID_RECHECK_S
     box = _face("face#7", OTHER)
     identity.update(IMAGE, [box], policy, now + FRAME_S)
     assert decide(box, policy.snapshot()) == "blur"
@@ -227,7 +232,7 @@ def test_owner_with_show_override_is_also_swap_checked() -> None:
     _owners(identity, {"face#2": OWNER}, policy, 0.0)
     policy.set_track_override("face#2", "show")
     now = _run(identity, policy, {"face#2": OWNER}, FRAME_S, 0.5)
-    _run(identity, policy, {"face#2": STRANGER}, now, 1.1)
+    _run(identity, policy, {"face#2": STRANGER}, now, 1.3)  # re-check near t=1.0 plus two retries
     assert policy.snapshot().track_overrides == {}
 
 
@@ -251,11 +256,13 @@ def test_embedding_failure_is_not_owner_and_clears_show_override() -> None:
     assert policy.snapshot().track_overrides == {}
 
 
-def test_owner_whose_recheck_fails_loses_owner() -> None:
+def test_owner_whose_rechecks_fail_loses_owner() -> None:
     identity, _ = _identity()
     policy = Policy()
     assert _owners(identity, {"face#2": OWNER}, policy, 0.0) == ["face#2"]
-    assert _owners(identity, {"face#2": BROKEN}, policy, 1.0) == []
+    assert _owners(identity, {"face#2": BROKEN}, policy, 1.0) == ["face#2"]
+    assert _owners(identity, {"face#2": BROKEN}, policy, 1.0 + FRAME_S) == ["face#2"]
+    assert _owners(identity, {"face#2": BROKEN}, policy, 1.0 + 2 * FRAME_S) == []
 
 
 def test_zero_embedding_fails_closed() -> None:
@@ -266,6 +273,129 @@ def test_zero_embedding_fails_closed() -> None:
     policy.set_track_override("face#1", "show")
     assert _owners(identity, {"face#1": OWNER}, policy, 0.0) == []
     assert policy.snapshot().track_overrides == {}
+
+
+# --- one bad frame is retried, not trusted ---
+
+
+def test_one_bad_frame_keeps_the_owner() -> None:
+    identity, _ = _identity()
+    policy = Policy()
+    _owners(identity, {"face#1": OWNER}, policy, 0.0)
+    assert _owners(identity, {"face#1": STRANGER}, policy, 1.0) == ["face#1"]  # motion blur at the re-check
+    assert _owners(identity, {"face#1": OWNER}, policy, 1.0 + FRAME_S) == ["face#1"]
+    now = _run(identity, policy, {"face#1": OWNER}, 1.0 + 2 * FRAME_S, 3.0)
+    assert _owners(identity, {"face#1": OWNER}, policy, now) == ["face#1"]
+
+
+def test_three_bad_frames_in_a_row_revoke_the_owner() -> None:
+    identity, _ = _identity()
+    policy = Policy()
+    _owners(identity, {"face#1": OWNER}, policy, 0.0)
+    owners = [_owners(identity, {"face#1": STRANGER}, policy, 1.0 + i * FRAME_S) for i in range(4)]
+    assert owners == [["face#1"], ["face#1"], [], []]
+
+
+def test_bad_good_bad_bad_keeps_the_owner() -> None:
+    identity, embedder = _identity()
+    policy = Policy()
+    _owners(identity, {"face#1": OWNER}, policy, 0.0)
+    assert _owners(identity, {"face#1": STRANGER}, policy, 1.0) == ["face#1"]  # bad
+    assert _owners(identity, {"face#1": OWNER}, policy, 1.1) == ["face#1"]  # good: back to once a second
+    calls = len(embedder.calls)
+    _run(identity, policy, {"face#1": STRANGER}, 1.2, 2.05)  # not re-checked until 2.1, so no strikes
+    assert len(embedder.calls) == calls
+    assert _owners(identity, {"face#1": STRANGER}, policy, 2.1) == ["face#1"]  # bad
+    assert _owners(identity, {"face#1": STRANGER}, policy, 2.1 + FRAME_S) == ["face#1"]  # bad
+    assert _owners(identity, {"face#1": STRANGER}, policy, 2.1 + 2 * FRAME_S) == []  # third in a row
+
+
+def test_swapped_face_on_a_shown_track_is_revoked_after_three_frames() -> None:
+    identity, _ = _identity()
+    policy = Policy()
+    _owners(identity, {"face#7": STRANGER}, policy, 0.0)
+    policy.set_track_override("face#7", "show")
+    _owners(identity, {"face#7": STRANGER}, policy, FRAME_S)  # reference saved, last check
+    first_failure = 1.2  # the next scheduled re-check
+    for i in range(3):
+        assert policy.snapshot().track_overrides == {"face#7": "show"}
+        _owners(identity, {"face#7": OTHER}, policy, first_failure + i * FRAME_S)
+    assert policy.snapshot().track_overrides == {}
+    assert 2 * FRAME_S < 0.5  # revoked on the third failed frame, well inside the 0.5 s window
+    box = _face("face#7", OTHER)
+    identity.update(IMAGE, [box], policy, first_failure + 3 * FRAME_S)
+    assert decide(box, policy.snapshot()) == "blur"
+
+
+def test_one_bad_frame_keeps_a_show_override() -> None:
+    identity, embedder = _identity()
+    policy = Policy()
+    _owners(identity, {"face#7": STRANGER}, policy, 0.0)
+    policy.set_track_override("face#7", "show")
+    _owners(identity, {"face#7": STRANGER}, policy, FRAME_S)
+    calls = len(embedder.calls)
+    _owners(identity, {"face#7": OTHER}, policy, 1.2)  # turned head at the re-check
+    assert len(embedder.calls) == calls + 1
+    _run(identity, policy, {"face#7": STRANGER}, 1.2 + FRAME_S, 4.0)
+    assert policy.snapshot().track_overrides == {"face#7": "show"}
+
+
+def test_new_track_that_misses_first_and_matches_next_frame_is_owner_then() -> None:
+    identity, _ = _identity()
+    policy = Policy()
+    _owners(identity, {"face#1": OWNER}, policy, 0.0)
+    _owners(identity, {}, policy, 0.5)  # the tracker lost the owner
+    assert _owners(identity, {"face#2": STRANGER}, policy, 0.6) == []  # blurry first frame of the new id
+    assert _owners(identity, {"face#2": OWNER}, policy, 0.6 + FRAME_S) == ["face#2"]
+
+
+def test_new_track_retries_for_half_a_second_then_once_a_second() -> None:
+    identity, embedder = _identity()
+    policy = Policy()
+    now = _run(identity, policy, {"face#2": STRANGER}, 0.0, 0.5)
+    assert len(embedder.calls) == 8  # every frame inside the retry window
+    _run(identity, policy, {"face#2": STRANGER}, now, 1.0)
+    assert len(embedder.calls) == 8  # back to once a second
+
+
+def test_held_over_boxes_neither_add_strikes_nor_rescue_a_failing_track() -> None:
+    identity, embedder = _identity()
+    policy = Policy()
+    _owners(identity, {"face#1": OWNER}, policy, 0.0)
+    policy.set_track_override("face#1", "show")
+    _owners(identity, {"face#1": OWNER}, policy, FRAME_S)  # reference saved
+    assert _owners(identity, {"face#1": STRANGER}, policy, 1.0) == ["face#1"]  # strike 1
+    calls = len(embedder.calls)
+    for i in range(1, 7):  # held over until 1.4: not embedded, no strikes
+        assert _owners(identity, {"face#1": None}, policy, 1.0 + i * FRAME_S) == ["face#1"]
+    assert len(embedder.calls) == calls
+    assert _owners(identity, {"face#1": STRANGER}, policy, 1.0 + 7 * FRAME_S) == ["face#1"]  # strike 2
+    assert policy.snapshot().track_overrides == {"face#1": "show"}
+    # Held over again past 0.5 s after the first failure: revoked without a third check.
+    assert _owners(identity, {"face#1": None}, policy, 1.0 + 8 * FRAME_S) == []
+    assert policy.snapshot().track_overrides == {}
+
+
+def test_steady_state_embeds_each_track_at_most_once_per_second(monkeypatch) -> None:
+    monkeypatch.setattr(config, "ID_RECHECK_S", 1.0)
+    times: dict[int, list[float]] = {OWNER: [], STRANGER: [], OTHER: []}
+    now = 0.0
+
+    def embed(image: np.ndarray, face_row: np.ndarray) -> np.ndarray:
+        times[int(face_row[0])].append(now)
+        return PEOPLE[int(face_row[0])]
+
+    identity = OwnerIdentity(embed=embed)
+    identity.enroll(IMAGE, _row(OWNER))
+    times[OWNER].clear()
+    policy = Policy()
+    policy.set_track_override("face#3", "show")
+    for i in range(60):  # 4 s at 15 FPS, with the owner in view
+        now = i * FRAME_S
+        _owners(identity, {"face#1": OWNER, "face#2": STRANGER, "face#3": OTHER}, policy, now)
+    for track_times in times.values():
+        assert 4 <= len(track_times) <= 5
+        assert all(b - a >= 1.0 - 1e-9 for a, b in zip(track_times, track_times[1:]))
 
 
 # --- real SFace ---
@@ -381,6 +511,9 @@ def test_clip_swapped_face_clears_the_override(clip: Path) -> None:
     frame(person_b, 1.5)
     assert policy.snapshot().track_overrides == {"face#7": "show"}  # next re-check is at 2.0
     frame(person_b, 2.0)
+    frame(person_b, 2.0 + 1 / 15)
+    assert policy.snapshot().track_overrides == {"face#7": "show"}  # two strikes so far
+    frame(person_b, 2.0 + 2 / 15)
     assert policy.snapshot().track_overrides == {}
 
 
