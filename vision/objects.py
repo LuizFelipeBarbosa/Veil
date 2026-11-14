@@ -16,16 +16,32 @@ from contracts import OBJECT_CLASSES, BufferedFrame, Detection
 log = logging.getLogger(__name__)
 
 # The text prompts YOLOE is given, and the contract label each one reports as.
-# Measured on tests/data/intersection.mov: "traffic sign" finds the street signs the
-# contract wordings miss. The NCNN export bakes in exactly these prompts, in this order.
-_PROMPT_LABELS = {
+# The NCNN export bakes in exactly these prompts, in this order.
+#
+# "street sign" means a sign that names a street (intersection blade signs, wall plates).
+# Measured on tests/data/intersection.mov (WP16): the old "traffic sign" prompt fired on
+# stop, one-way and other regulatory signs too, so it is gone. A box goes to its
+# best-matching prompt, so the traffic-sign prompts below (label None) pull those signs
+# away from the street-name prompts and their boxes are dropped. "traffic sign" itself is
+# deliberately not a distractor: it outscores "street name sign" on the real blade signs.
+_PROMPT_LABELS: dict[str, str | None] = {
     "license plate": "license plate",
-    "street sign": "street sign",
-    "traffic sign": "street sign",
+    "street name sign": "street sign",
+    "street name plate": "street sign",
     "house number": "house number",
     "storefront sign": "storefront sign",
     "sign with text": "storefront sign",
     "signboard": "storefront sign",
+    # Distractors: detected so they are not mistaken for the above, then ignored.
+    "stop sign": None,
+    "one way sign": None,
+    "traffic light": None,
+    "speed limit sign": None,
+    "parking sign": None,
+    "no parking sign": None,
+    "yield sign": None,
+    "do not enter sign": None,
+    "pedestrian crossing sign": None,
 }
 PROMPTS = tuple(_PROMPT_LABELS)
 
@@ -84,14 +100,19 @@ class ObjectDetector:
         result = self._model.predict(image, device=self._device, imgsz=self._imgsz, conf=self._conf, verbose=False)[0]
         height, width = image.shape[:2]
         boxes = result.boxes
-        return [
-            Detection(label=_label(result.names[int(cls)]), xyxy=_clipped_box(xyxy, width, height), conf=float(conf))
-            for xyxy, conf, cls in zip(boxes.xyxy.tolist(), boxes.conf.tolist(), boxes.cls.tolist())
-        ]
+        detections = []
+        for xyxy, conf, cls in zip(boxes.xyxy.tolist(), boxes.conf.tolist(), boxes.cls.tolist()):
+            label = _label(result.names[int(cls)])
+            if label is not None:  # None: a distractor prompt, never blurred
+                detections.append(Detection(label=label, xyxy=_clipped_box(xyxy, width, height), conf=float(conf)))
+        return detections
 
 
-def _label(prompt: str) -> str:
-    """The contract label for a model class name. An unknown name means a stale export: fail loudly."""
+def _label(prompt: str) -> str | None:
+    """The contract label for a model class name, or None for a distractor.
+
+    An unknown name means a stale export: fail loudly.
+    """
     try:
         return _PROMPT_LABELS[prompt]
     except KeyError:
