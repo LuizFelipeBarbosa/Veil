@@ -10,16 +10,23 @@ own boxes, and hand it to the preview and the recorder.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import threading
+import time
 
 import cv2
 import numpy as np
 
 import config
 from capture import CaptureThread, FrameSource, RingBuffer
-from contracts import BufferedFrame, CensoredFrame, Policy
+from contracts import EMPTY_SCENE, FACE, Action, BufferedFrame, CensoredFrame, Policy, PolicySnapshot, Scene, TrackedBox
 from recorder import Recorder
+from vision import policy as policy_rules
+from vision import render
+from vision.faces import FaceDetector
+from vision.identity import OwnerIdentity
+from vision.tracking import make_face_tracker
 
 log = logging.getLogger(__name__)
 
@@ -47,10 +54,33 @@ class Pipeline(threading.Thread):
         self._stop_requested = threading.Event()
         self._latest_lock = threading.Lock()
         self._latest: CensoredFrame | None = None
+        self._scene: Scene = EMPTY_SCENE
+
+        self._faces = FaceDetector()
+        self._face_tracker = make_face_tracker()
+        self._identity = OwnerIdentity()
+        self._hold_over = render.HoldOver()
+        self._watchdog = render.Watchdog(watch_objects=False)  # WP5 turns the object watchdog on
+        self._seen_track_ids: set[str] = set()
+        self._owner_id: str | None = None
+        self._enroll_requested = threading.Event()
 
     def latest(self) -> CensoredFrame | None:
         with self._latest_lock:
             return self._latest
+
+    def scene(self) -> Scene:
+        """What the agent may see and act on: the newest frame's confident tracks."""
+        with self._latest_lock:
+            return self._scene
+
+    def enroll_owner(self) -> None:
+        """Make the largest confident face in the next frame the owner. Safe from any thread."""
+        self._enroll_requested.set()
+
+    @property
+    def owner_enrolled(self) -> bool:
+        return self._identity.enrolled
 
     def stop(self) -> None:
         self._stop_requested.set()
@@ -83,8 +113,6 @@ class Pipeline(threading.Thread):
         """A frame whose detection fails keeps faces_done False, so it leaves the buffer pixelated."""
         try:
             self._detect(frame)
-        except NotImplementedError:
-            pass
         except Exception:
             log.exception("detection failed on frame %d; it will be pixelated whole", frame.index)
 
@@ -98,7 +126,57 @@ class Pipeline(threading.Thread):
             return fail_closed_frame(frame.image, frame.index)
 
     def _detect(self, frame: BufferedFrame) -> None:
-        raise NotImplementedError("wired when WP2 merges: faces, tracking, hold-over, backfill, watchdog")
+        """Faces on the newest frame: track, identify, hold over, backfill, heartbeat."""
+        now = time.monotonic()
+        tracked = self._face_tracker.update(self._faces.detect(frame.image), frame.index, now)
+        if self._enroll_requested.is_set():
+            self._enroll_largest_face(frame.image, tracked)
+        self._identity.update(frame.image, tracked, self._policy, now)
+        self._owner_id = next((box.id for box in tracked if box.is_owner), None)
+
+        frame.boxes.extend(self._with_held_boxes(tracked, now, frame.index))
+        new_boxes = [box for box in tracked if box.id not in self._seen_track_ids]
+        self._seen_track_ids.update(box.id for box in new_boxes)
+        render.backfill(self._ring.recent(config.BACKFILL_FRAMES + 1)[:-1], new_boxes)
+        frame.faces_done = True
+        self._watchdog.beat_faces(now)
+
+        confident = [box for box in tracked if box.conf >= config.SCENE_MIN_CONF]
+        scene = policy_rules.build_scene(confident, self._policy.snapshot(), config.FRAME_WIDTH, config.FRAME_HEIGHT)
+        with self._latest_lock:
+            self._scene = scene
+
+    def _with_held_boxes(self, tracked: list[TrackedBox], now: float, frame_index: int) -> list[TrackedBox]:
+        """This frame's boxes plus held-over ones. A held box is a guess, so it is never the owner."""
+        tracked_ids = {box.id for box in tracked}
+        return [
+            box if box.id in tracked_ids else dataclasses.replace(box, is_owner=False)
+            for box in self._hold_over.apply(tracked, now, frame_index=frame_index)
+        ]
+
+    def _enroll_largest_face(self, image: np.ndarray, tracked: list[TrackedBox]) -> None:
+        candidates = [
+            box for box in tracked
+            if box.label == FACE and box.face_row is not None and box.conf >= config.SCENE_MIN_CONF
+        ]
+        if not candidates:
+            return  # keep the request until a confident face shows up
+        largest = max(candidates, key=lambda box: (box.xyxy[2] - box.xyxy[0]) * (box.xyxy[3] - box.xyxy[1]))
+        self._identity.enroll(image, largest.face_row)
+        self._enroll_requested.clear()
+        log.info("owner enrolled from %s", largest.id)
 
     def _censor(self, frame: BufferedFrame) -> CensoredFrame:
-        raise NotImplementedError("wired when WP2 merges: render.censor with policy.decide")
+        return render.censor(
+            frame, self._policy.snapshot(), self._decide, self._watchdog.tripped(time.monotonic())
+        )
+
+    def _decide(self, box: TrackedBox, policy: PolicySnapshot) -> Action:
+        """policy.decide, except that a buffered box only counts as the owner while its track still is.
+
+        The frame leaving the buffer was marked a second ago; if the ID-swap check has
+        since taken ownership away from that track, the old mark must not show a face.
+        """
+        if box.is_owner and box.id != self._owner_id:
+            box = dataclasses.replace(box, is_owner=False)
+        return policy_rules.decide(box, policy)

@@ -39,6 +39,7 @@ def main() -> None:
             recording_s=recorder.elapsed_s,
             fail_closed=latest is None or latest.fail_closed,
             panic=policy.snapshot().panic,
+            owner_enrolled=pipeline.owner_enrolled,
         )
 
     pipeline.start()
@@ -46,7 +47,11 @@ def main() -> None:
         ui.run(
             get_frame=pipeline.latest,
             get_status=status,
-            callbacks=ui.UiCallbacks(on_record_toggle=toggle_recording, on_panic=policy.set_panic),
+            callbacks=ui.UiCallbacks(
+                on_record_toggle=toggle_recording,
+                on_panic=policy.set_panic,
+                on_enroll_owner=pipeline.enroll_owner,
+            ),
             max_frames=args.frames,
         )
     finally:

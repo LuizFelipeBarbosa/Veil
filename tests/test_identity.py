@@ -322,13 +322,19 @@ def _sface() -> OwnerIdentity:
 
 
 @needs_models
-@pytest.mark.parametrize("clip", [CROSSING_CLIP, FACES_CLIP], ids=["crossing", "faces"])
+@pytest.mark.parametrize("clip", [CROSSING_CLIP], ids=["crossing"])  # in faces.mov nobody stays in frame
 def test_clip_same_person_matches_across_frames(clip: Path) -> None:
     frames = _clip_faces(clip)
-    largest = [(image, rows[0]) for image, rows in frames]
-    assert len(largest) >= 2
+    # confident faces only: a half-visible face at the frame edge is not a fair identity sample
+    frames = [(image, rows[rows[:, 14] >= 0.8]) for image, rows in frames]
+    frames = [(image, rows) for image, rows in frames if len(rows)]
+    assert len(frames) >= 2
     identity = _sface()
-    (first_image, first_row), (later_image, later_row) = largest[0], largest[min(5, len(largest) - 1)]
+    first_image, first_rows = frames[0]
+    later_image, later_rows = frames[min(5, len(frames) - 1)]
+    first_row = first_rows[0]
+    # rows are not ordered by person: follow the first face by position
+    later_row = min(later_rows, key=lambda row: abs(row[0] - first_row[0]) + abs(row[1] - first_row[1]))
     identity.enroll(first_image, first_row)
     box = TrackedBox(id="face#1", label="face", xyxy=(0, 0, 1, 1), conf=1.0, frame_index=0, last_seen=0.0,
                      face_row=later_row)

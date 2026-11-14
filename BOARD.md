@@ -6,12 +6,12 @@ Milestones: 13:00 faces blurred (Mac) | 14:00 owner + signs/plates | 14:45 voice
 | --- | --- | --- | --- | --- | --- |
 | 0 | Scaffold and contracts | done | 11:20–11:45 | main | — |
 | 1 | Capture, basic preview, recorder | merged 11:31 | 11:27–11:31 | wp1-capture | — |
-| 2 | Faces, face tracker, pixelation, watchdog | running since 11:27 (70 min box) | 11:27–12:40 | wp2-faces | face clip in tests/data (HUMAN) |
+| 2 | Faces, face tracker, pixelation, watchdog | merged 11:42 as PARTIAL: leak test fails, needs DECIDE on its bar | 11:27–11:42 | wp2-faces | lead: leak-test bar |
 | 7 | Voice: Deepgram Voice Agent and tools | running since 11:27 (120 min box) | 11:27–13:30 | wp7-voice | — |
-| 6 | Owner ID, ID-swap check, policy, scene builder | merged 11:37; 7 real-face tests skipped until clips exist | 11:32–11:37 | wp6-identity | crossing.mov, faces.mov (HUMAN) |
-| 5 | Objects: YOLOE-26n and NCNN export | queued (WP2's slot) | 13:00–14:00 | wp5-objects | needs WP2; props clip (HUMAN) |
-| 3 | Touch app UI | running since 11:38 (45 min box) | 11:38–12:25 | wp3-ui | — |
-| 8 | Integration (orchestrator) | queued | 14:00–14:45 | main | needs WP1–7 |
+| 6 | Owner ID, ID-swap check, policy, scene builder | merged 11:37; real-face tests pass | 11:32–11:37 | wp6-identity | — |
+| 5 | Objects: YOLOE-26n and NCNN export | running since 11:52 (50 min box) | 11:52–12:45 | wp5-objects | — |
+| 3 | Touch app UI | merged 11:42 | 11:38–11:42 | wp3-ui | — |
+| 8 | Integration (orchestrator) | faces path wired in pipeline.py 11:50; voice and objects pending | 14:00–14:45 | main | needs WP5, WP7 |
 | 9 | Pi port (orchestrator + lead) | queued | 14:45–15:30 | main | needs WP8, the Pi |
 | 10 | Leak review (read-only) | queued | 15:30–16:00 | — | needs WP9 |
 | 11 | README and Devpost text | queued | 16:30–17:15 | wp11-readme | needs WP9 |

@@ -52,6 +52,12 @@ def panic_policy() -> PolicySnapshot:
 # --- padding and pixelation ---
 
 
+@pytest.fixture(autouse=True)
+def _brief_padding(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These tests state their expectations at 20% padding, whatever config is tuned to."""
+    monkeypatch.setattr(config, "BOX_PADDING", 0.20)
+
+
 def test_pad_box_grows_20_percent_per_side() -> None:
     assert pad_box((100, 100, 200, 150), WIDTH, HEIGHT) == (80, 90, 220, 160)
 

@@ -36,7 +36,7 @@ CAMERA_FACES_OPERATOR = not _ON_PI
 
 # --- faces (YuNet) and owner (SFace) ---
 YUNET_INPUT_SIZE = (320, 240) if _ON_PI else (640, 480)  # (width, height)
-FACE_SCORE = 0.6
+FACE_SCORE = 0.3  # Brief: 0.6. Lowered after the leak test: real faces scored 0.3-0.6 went unblurred
 SFACE_COSINE_MATCH = 0.363
 ID_RECHECK_S = 1.0
 
@@ -48,13 +48,14 @@ YOLOE_CLASSES = ("license plate", "street sign", "house number", "storefront sig
 YOLOE_CONF = 0.25
 
 # --- censoring ---
-BOX_PADDING = 0.20  # per side
+BOX_PADDING = 0.35  # per side. Brief: 0.20. Raised after the leak test: cheeks and ears showed
 HOLD_OVER_S = 0.5  # a lost track stays blurred this long
 PIXEL_BLOCK = 16  # px
 FACE_WATCHDOG_S = 0.300  # no finished face detection for this long: whole frame pixelates
 OBJECT_WATCHDOG_S = 1.5
 
 # --- scene ---
+SCENE_MIN_CONF = 0.6  # weaker boxes are blurred but not offered to the agent, so they can't be unblurred
 NEAR_BOX_HEIGHT_FRACTION = 0.25  # a box at least this tall, relative to the frame, is "near"
 CENTER_BAND_FRACTION = 0.2  # middle band of the frame that counts as "center" when no owner is in frame
 
