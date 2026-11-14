@@ -1,10 +1,10 @@
-"""WP7 live check: 20 typed commands through Deepgram's Voice Agent against the fixture scenes.
+"""WP7/WP14 live check: typed commands through Deepgram's Voice Agent against fixture scenes.
 
     set -a; source .env; set +a; python scripts/voice_check.py [--model gpt-4.1-mini ...]
 
 Text only (use_audio=False): no mic or speaker is opened. Each command gets a fresh
 Policy and a fresh agent session, so no command sees another's history. The keyword
-fallback is off, so the score measures the model alone. Exits nonzero below 20/20.
+fallback is off, so the score measures the model alone. Exits nonzero below a full score.
 """
 
 from __future__ import annotations
@@ -21,23 +21,27 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import config  # noqa: E402
-from contracts import Policy, Scene  # noqa: E402
+from contracts import KNOWN_CLASSES, Policy, Scene, SceneTrack  # noqa: E402
 from fakes import scenes  # noqa: E402
 from voice.dg_agent import VoiceAgent  # noqa: E402
 from voice.tools import ToolHandlers  # noqa: E402
 
 GET_SCENE = ("get_scene", {})
-STATE_TOOLS = {"set_class_rule", "set_track", "blur_all", "clear_panic"}
+STATE_TOOLS = {"set_class_rule", "set_track", "blur_all", "clear_panic", "show_all"}
 CAN_HIDE_WORDS = ("face", "plate", "street", "house", "storefront")
 
 
 @dataclass(frozen=True)
 class Case:
-    scene: str  # key in fakes.scenes.ALL
+    scene: str  # key in SCENES
     text: str
     expected: tuple[tuple[str, dict[str, Any]], ...]  # in order; get_scene listed only where required
     asks: bool = False  # must reply with a question, no state change
     lists_types: bool = False  # must reply naming what it can hide, no state change
+    any_order: tuple[tuple[str, dict[str, Any]], ...] = ()  # all required, in any order, after `expected`
+    reply_lacks: tuple[str, ...] = ()  # the reply must contain none of these
+    follow_up: str = ""  # a second user turn in the same session, sent once the first reply settles
+    then_scene: str = ""  # the scene after the first get_scene call (a track got a new id)
 
 
 def _rule(label: str, action: str) -> tuple[str, dict[str, Any]]:
@@ -48,6 +52,86 @@ def _track(track_id: str, action: str) -> tuple[str, dict[str, Any]]:
     return ("set_track", {"track_id": track_id, "action": action})
 
 
+def _sighting(track_id: str, label: str, side: str, distance: str, state: str) -> SceneTrack:
+    return SceneTrack(id=track_id, label=label, side=side, distance=distance, state=state)  # type: ignore[arg-type]
+
+
+def _scene(owner: str | None, *tracks: SceneTrack, shown: tuple[str, ...] = ()) -> Scene:
+    rules = {label: "show" if label in shown else "blur" for label in KNOWN_CLASSES}
+    return Scene(owner=owner, tracks=tracks, class_rules=rules, panic=False)  # type: ignore[arg-type]
+
+
+_OWNER = _sighting("face#2", "face", "center", "near", "show")
+
+# Extra WP14 scenes, built here because fakes/ is read-only for this package.
+SCENES: dict[str, Scene] = {
+    **scenes.ALL,
+    # two people on the owner's left, one on the right
+    "two_left": _scene(
+        "face#2", _OWNER,
+        _sighting("face#5", "face", "owner_left", "near", "blur"),
+        _sighting("face#7", "face", "owner_left", "far", "blur"),
+        _sighting("face#9", "face", "owner_right", "near", "blur"),
+    ),
+    # both friends were unblurred earlier
+    "friends_shown": _scene(
+        "face#2", _OWNER,
+        _sighting("face#7", "face", "owner_left", "near", "show"),
+        _sighting("face#9", "face", "owner_right", "far", "show"),
+    ),
+    # one friend shown, one still blurred: "her again" can only be face#7
+    "one_friend_shown": _scene(
+        "face#2", _OWNER,
+        _sighting("face#7", "face", "owner_left", "near", "show"),
+        _sighting("face#9", "face", "owner_right", "far", "blur"),
+    ),
+    # plates and signs shown as a class; no owner, so sides are the operator's view
+    "objects_shown": _scene(
+        None,
+        _sighting("obj#1", "street sign", "left", "far", "show"),
+        _sighting("obj#3", "license plate", "right", "near", "show"),
+        _sighting("obj#6", "license plate", "left", "near", "show"),
+        shown=("license plate", "street sign"),
+    ),
+    # the owner in frame, a street sign far behind
+    "owner_and_sign": _scene(
+        "face#2", _OWNER,
+        _sighting("obj#1", "street sign", "center", "far", "show"),
+        _sighting("obj#3", "license plate", "owner_right", "near", "blur"),
+        shown=("street sign",),
+    ),
+    # two plates, both blurred: "the plate" alone is ambiguous
+    "two_plates": _scene(
+        None,
+        _sighting("obj#3", "license plate", "right", "near", "blur"),
+        _sighting("obj#6", "license plate", "left", "far", "blur"),
+    ),
+    # the face class is shown: everyone is unblurred
+    "faces_shown_class": _scene(
+        "face#2", _OWNER,
+        _sighting("face#7", "face", "owner_left", "near", "show"),
+        _sighting("face#9", "face", "owner_right", "far", "show"),
+        shown=("face",),
+    ),
+    # the face class is shown, one other person in view
+    "one_face_shown_class": _scene(
+        "face#2", _OWNER,
+        _sighting("face#7", "face", "owner_left", "near", "show"),
+        shown=("face",),
+    ),
+    # owner_and_friend_left after the tracker lost the friend and found her again as face#8
+    "friend_renumbered": _scene(
+        "face#2", _OWNER,
+        _sighting("face#8", "face", "owner_left", "near", "blur"),
+        _sighting("obj#3", "license plate", "right", "far", "blur"),
+    ),
+}
+
+_RESET = (("clear_panic", {}), *(_rule(label, "blur") for label in KNOWN_CLASSES))
+_SHOW_FACES = (_rule("face", "show"),)
+# Showing the face class keeps new people unblurred: no follow-up question, no "they stay blurred".
+_STILL_BLURRED = ("still be blurred", "stay blurred", "will be blurred", "remain blurred", "?")
+
 CASES = [
     Case("owner_and_friend_left", "Unblur the person on my left, she's with me.", (GET_SCENE, _track("face#7", "show"))),
     Case("two_candidates", "Unblur the guy.", (GET_SCENE,), asks=True),
@@ -57,7 +141,8 @@ CASES = [
     Case("signs_and_plate", "Show the street signs again.", (_rule("street sign", "show"),)),
     Case("signs_and_plate", "Hide license plates.", (_rule("license plate", "blur"),)),
     Case("panic", "Clear panic.", (("clear_panic", {}),)),
-    Case("panic", "Stop the panic, back to normal.", (("clear_panic", {}),)),
+    # WP14: "back to normal" is now a full reset, not just clear_panic
+    Case("panic", "Stop the panic, back to normal.", (), any_order=_RESET),
     Case("signs_and_plate", "Show the house numbers.", (_rule("house number", "show"),)),
     Case("empty", "Show storefront signs.", (_rule("storefront sign", "show"),)),
     Case("owner_and_friend_left", "Panic!", (("blur_all", {}),)),
@@ -69,6 +154,40 @@ CASES = [
     Case("owner_and_friend_left", "Blur my face too.", (GET_SCENE, _track("face#2", "blur"))),
     Case("empty", "Pixelate the house numbers.", (_rule("house number", "blur"),)),
     Case("signs_and_plate", "Unblur the license plates.", (_rule("license plate", "show"),)),
+    # --- WP14: everything, selective, both directions ---
+    Case("owner_and_friend_left", "Unblur everything.", (("show_all", {}),)),
+    Case("signs_and_plate", "Show everything.", (("show_all", {}),)),
+    Case("two_candidates", "Unblur all faces.", _SHOW_FACES, reply_lacks=_STILL_BLURRED),
+    Case("owner_and_friend_left", "Show all the faces.", _SHOW_FACES, reply_lacks=_STILL_BLURRED),
+    Case(
+        "two_left", "Unblur the two people on my left.", (GET_SCENE,),
+        any_order=(_track("face#5", "show"), _track("face#7", "show")),
+    ),
+    Case("objects_shown", "Blur the plate on the right.", (GET_SCENE, _track("obj#3", "blur"))),
+    Case("owner_and_sign", "Hide the sign behind me.", (GET_SCENE, _track("obj#1", "blur"))),
+    Case("one_friend_shown", "Blur her again.", (GET_SCENE, _track("face#7", "blur"))),
+    Case("friends_shown", "Blur the person on my right.", (GET_SCENE, _track("face#9", "blur"))),
+    Case("two_plates", "Unblur the plate.", (GET_SCENE,), asks=True),
+    Case("signs_and_plate", "Hide all license plates.", (_rule("license plate", "blur"),)),
+    Case("empty", "Show street signs.", (_rule("street sign", "show"),)),
+    Case("owner_and_friend_left", "Reset.", (), any_order=_RESET),
+    # --- WP14 revision: the face class may be shown ---
+    Case("two_candidates", "Unblur everyone.", _SHOW_FACES, reply_lacks=_STILL_BLURRED),
+    Case("empty", "Keep everyone unblurred.", _SHOW_FACES, reply_lacks=_STILL_BLURRED),
+    Case("owner_and_friend_left", "People should start unblurred.", _SHOW_FACES, reply_lacks=_STILL_BLURRED),
+    Case("faces_shown_class", "Blur everyone.", (_rule("face", "blur"),)),
+    Case("faces_shown_class", "Blur people again.", (_rule("face", "blur"),)),
+    Case("faces_shown_class", "Blur the person on my left.", (GET_SCENE, _track("face#7", "blur"))),
+    Case("one_face_shown_class", "Blur her.", (GET_SCENE, _track("face#7", "blur"))),
+    Case(
+        "two_candidates", "Unblur the guy.", (GET_SCENE, _track("face#7", "show")),
+        asks=True, follow_up="The closer one.",
+    ),
+    Case(
+        "owner_and_friend_left", "Unblur the person on my left.",
+        (GET_SCENE, _track("face#7", "show"), GET_SCENE, _track("face#8", "show")),
+        then_scene="friend_renumbered",
+    ),
 ]
 
 
@@ -79,6 +198,7 @@ class _Run:
     sent_at: float = 0.0
     calls: list[tuple[str, dict[str, Any], dict[str, Any], float]] = field(default_factory=list)
     replies: list[tuple[str, float]] = field(default_factory=list)
+    first_turn_replies: int = 0  # how many replies came before the follow-up was sent
     errors: list[str] = field(default_factory=list)
     last_event: float = 0.0
     lock: threading.Lock = field(default_factory=threading.Lock)
@@ -88,12 +208,18 @@ class _Run:
 
 
 class _RecordingHandlers(ToolHandlers):
-    def __init__(self, policy: Policy, scene: Scene, run: _Run) -> None:
-        super().__init__(policy, lambda: scene)
+    """Records every call; switches to `then_scene` once the agent has read the first scene."""
+
+    def __init__(self, policy: Policy, scene: Scene, then_scene: Scene | None, run: _Run) -> None:
+        super().__init__(policy, lambda: self._scene)
+        self._scene = scene
+        self._then_scene = then_scene
         self._run = run
 
     def handle(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         result = super().handle(name, arguments)
+        if name == "get_scene" and self._then_scene is not None:
+            self._scene, self._then_scene = self._then_scene, None
         with self._run.lock:
             self._run.calls.append((name, arguments, result, self._run.ms()))
             self._run.last_event = time.monotonic()
@@ -114,8 +240,9 @@ def run_case(case: Case, overrides: dict[str, Any], timeout_s: float = 15.0) -> 
                 run.replies.append((text, run.ms()))
             run.last_event = time.monotonic()
 
+    then_scene = SCENES[case.then_scene] if case.then_scene else None
     agent = VoiceAgent(
-        _RecordingHandlers(policy, scenes.ALL[case.scene], run),
+        _RecordingHandlers(policy, SCENES[case.scene], then_scene, run),
         on_transcript,
         use_audio=False,
         keyword_fallback_s=None,
@@ -128,38 +255,60 @@ def run_case(case: Case, overrides: dict[str, Any], timeout_s: float = 15.0) -> 
             return run
         run.sent_at = time.monotonic()
         agent.inject_text(case.text)
-        deadline = run.sent_at + timeout_s
-        while time.monotonic() < deadline:
-            time.sleep(0.05)
+        _wait_until_settled(run, run.sent_at + timeout_s)
+        if case.follow_up and not run.errors:
             with run.lock:
-                settled = run.replies and time.monotonic() - run.last_event > 1.0
-                if settled or run.errors:
-                    break
+                run.first_turn_replies = len(run.replies)
+            agent.inject_text(case.follow_up)
+            _wait_until_settled(run, time.monotonic() + timeout_s, after=run.first_turn_replies)
     finally:
         agent.stop()
         agent.join(timeout=3.0)
     return run
 
 
+def _wait_until_settled(run: _Run, deadline: float, after: int = 0) -> None:
+    """Until a reply (beyond the first `after`) has come and nothing else happened for 1 s."""
+    while time.monotonic() < deadline:
+        time.sleep(0.05)
+        with run.lock:
+            settled = len(run.replies) > after and time.monotonic() - run.last_event > 1.0
+            if settled or run.errors:
+                return
+
+
 def judge(case: Case, run: _Run) -> tuple[bool, str]:
-    """Expected calls in order (extra get_scene calls allowed), and nothing else that changes state."""
+    """Expected calls in order (extra get_scene calls allowed), then every any-order call,
+    and nothing else that changes state."""
     actual = [(name, args) for name, args, _, _ in run.calls]
     remaining = list(case.expected)
-    for call in actual:
+    after_expected = 0
+    for position, call in enumerate(actual):
         if remaining and call == remaining[0]:
             remaining.pop(0)
+            after_expected = position + 1
     if remaining:
         return False, f"missing {remaining[0]}"
-    extra = [c for c in actual if c[0] in STATE_TOOLS and c not in case.expected]
+    unordered_missing = [c for c in case.any_order if c not in actual[after_expected:]]
+    if unordered_missing:
+        return False, f"missing {unordered_missing[0]}"
+    allowed = (*case.expected, *case.any_order)
+    extra = [c for c in actual if c[0] in STATE_TOOLS and c not in allowed]
     if extra:
         return False, f"unexpected {extra[0]}"
     reply = " ".join(text for text, _ in run.replies).lower()
     if not reply:
         return False, "no reply text"
-    if case.asks and "?" not in reply:
+    if case.follow_up and len(run.replies) <= run.first_turn_replies:
+        return False, "no reply to the follow-up"
+    first_turn = run.replies[: run.first_turn_replies] if case.follow_up else run.replies
+    if case.asks and "?" not in " ".join(text for text, _ in first_turn):
         return False, "expected a question"
     if case.lists_types and sum(word in reply for word in CAN_HIDE_WORDS) < 3:
         return False, "reply doesn't list the hideable types"
+    said = [word for word in case.reply_lacks if word in reply]
+    if said:
+        return False, f"reply shouldn't say {said[0]!r}"
     return True, "ok"
 
 
@@ -172,13 +321,16 @@ def check_model(overrides: dict[str, Any]) -> tuple[int, list[float], list[float
         ok, why = judge(case, run)
         passed += ok
         first_tool = run.calls[0][3] if run.calls else None
-        last_reply = run.replies[-1][1] if run.replies else None
+        # a two-turn case's last reply includes the second user turn: leave it out of the median
+        last_reply = run.replies[-1][1] if run.replies and not case.follow_up else None
         if first_tool is not None:
             to_tool.append(first_tool)
         if last_reply is not None:
             to_reply.append(last_reply)
-        print(f"{number:2}. {'PASS' if ok else 'FAIL'} [{case.scene}] {case.text!r}  ({why})")
-        print(f"    expected: {_calls_text(case.expected) or '(no tool call)'}")
+        follow_up = f" then {case.follow_up!r}" if case.follow_up else ""
+        print(f"{number:2}. {'PASS' if ok else 'FAIL'} [{case.scene}] {case.text!r}{follow_up}  ({why})")
+        any_order = f" + any order: {_calls_text(case.any_order)}" if case.any_order else ""
+        print(f"    expected: {_calls_text(case.expected) or '(no tool call)'}{any_order}")
         print(f"    actual:   {_calls_text([(n, a) for n, a, _, _ in run.calls]) or '(no tool call)'}")
         print(f"    reply:    {' | '.join(text for text, _ in run.replies) or '-'}")
         print(f"    latency:  first tool {_ms(first_tool)}, reply {_ms(last_reply)}")
