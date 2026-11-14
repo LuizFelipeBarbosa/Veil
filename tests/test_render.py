@@ -199,7 +199,7 @@ def test_watchdog_is_tripped_before_the_first_beat() -> None:
 
 
 def test_watchdog_faces() -> None:
-    dog = Watchdog(watch_objects=False)
+    dog = Watchdog(face_limit_s=0.3, watch_objects=False)
     dog.beat_faces(now=1.0)
     assert not dog.tripped(now=1.29)
     assert dog.tripped(now=1.31)

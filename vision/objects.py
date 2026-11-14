@@ -8,6 +8,7 @@ import threading
 import time
 from typing import Callable
 
+import cv2
 import numpy as np
 
 import config
@@ -104,6 +105,7 @@ class ObjectDetector:
             self._imgsz = NCNN_IMGSZ
         else:
             raise ValueError(f"unknown YOLOE_RUNTIME {runtime!r}; use pytorch or ncnn")
+        _restore_opencv_threads()
         # Warm-up: the first call compiles kernels and, for NCNN, reads the model's class names.
         self.detect(np.zeros((config.FRAME_HEIGHT, config.FRAME_WIDTH, 3), dtype=np.uint8))
 
@@ -171,13 +173,30 @@ def _clipped_box(xyxy: list[float], width: int, height: int) -> tuple[int, int, 
     )
 
 
-class ObjectsThread(threading.Thread):
-    """Runs the detector on the newest buffered frame whenever it is free."""
+def _restore_opencv_threads() -> None:
+    """Importing ultralytics turns OpenCV's thread pool off (for its training DataLoader).
 
-    def __init__(self, detector: ObjectDetector, newest_frame: Callable[[], BufferedFrame | None]) -> None:
+    YuNet and SFace run on OpenCV; single-threaded they take over twice as long on the Pi.
+    """
+    cv2.setNumThreads(-1)
+
+
+class ObjectsThread(threading.Thread):
+    """Runs the detector on the newest buffered frame, at most once per min_period_s.
+
+    The pause leaves the cores to face detection, which must keep up with every frame.
+    """
+
+    def __init__(
+        self,
+        detector: ObjectDetector,
+        newest_frame: Callable[[], BufferedFrame | None],
+        min_period_s: float = config.OBJECT_MIN_PERIOD_S,
+    ) -> None:
         super().__init__(name="objects", daemon=True)
         self._detector = detector
         self._newest_frame = newest_frame
+        self._min_period_s = min_period_s
         self._stopped = threading.Event()
         self._lock = threading.Lock()
         self._latest: tuple[int, float, list[Detection]] | None = None
@@ -193,11 +212,13 @@ class ObjectsThread(threading.Thread):
     def run(self) -> None:
         last_index: int | None = None
         while not self._stopped.is_set():
+            started = time.monotonic()
             index = self._detect_newest(last_index)
             if index is None:
                 self._stopped.wait(_IDLE_WAIT_S)
             else:
                 last_index = index
+                self._stopped.wait(max(0.0, started + self._min_period_s - time.monotonic()))
 
     def _detect_newest(self, last_index: int | None) -> int | None:
         """Detect on the newest frame if it is new and return its index; None when there is nothing new.
