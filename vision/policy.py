@@ -5,11 +5,14 @@ from __future__ import annotations
 from typing import Sequence
 
 import config
-from contracts import ACTIONS, Action, Distance, PolicySnapshot, Scene, SceneTrack, Side, TrackedBox
+from contracts import ACTIONS, AD_CLASSES, REPLACE, Action, Distance, PolicySnapshot, Scene, SceneTrack, Side, TrackedBox
 
 
 def decide(box: TrackedBox, policy: PolicySnapshot) -> Action:
-    """Order: panic, track override, owner, class rule. Anything unknown blurs."""
+    """Order: panic, track override, owner, class rule. Anything unknown blurs.
+
+    "replace" holds only for an ad class with an image named for it; any other "replace" blurs.
+    """
     if policy.panic:
         return "blur"
     override = policy.track_overrides.get(box.id)
@@ -17,7 +20,12 @@ def decide(box: TrackedBox, policy: PolicySnapshot) -> Action:
         return override if override in ACTIONS else "blur"
     if box.is_owner:
         return "show"
-    return "show" if policy.class_rules.get(box.label) == "show" else "blur"
+    rule = policy.class_rules.get(box.label)
+    if rule == "show":
+        return "show"
+    if rule == REPLACE and box.label in AD_CLASSES and policy.replacements.get(box.label):
+        return REPLACE
+    return "blur"
 
 
 def build_scene(boxes: Sequence[TrackedBox], policy: PolicySnapshot, frame_width: int, frame_height: int) -> Scene:
