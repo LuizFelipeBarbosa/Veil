@@ -29,8 +29,10 @@ FRAME_HEIGHT = 480
 # Pi 4: one frame's face detection (upright + 2 rotated YuNet passes) takes about 155 ms next to
 # YOLOE. A frame period shorter than that starves the vision loop and every frame fails closed.
 FPS = 5 if _ON_PI else 15
-DELAY_BUFFER_FRAMES = FPS  # 1 s
-BACKFILL_FRAMES = round(FPS * 2 / 3)  # frames before a new face that get blurred too (about 0.67 s)
+# Brief: 1 s. The lead chose a short delay at 13:25: about a third of a second, so a face swap on a
+# shown track can be visible for roughly 0.2 s before the identity check re-blurs it.
+DELAY_BUFFER_FRAMES = max(2, round(FPS / 3))  # Mac: 5 frames (0.33 s). Pi at 5 FPS: 2 frames (0.4 s)
+BACKFILL_FRAMES = DELAY_BUFFER_FRAMES - 1  # frames before a new face that get blurred too
 
 # True when the camera points at the operator (laptop camera): the operator's
 # left is then the right side of the image. False for a camera pointing away.
