@@ -5,4 +5,4 @@ pygame
 sounddevice
 deepgram-sdk
 pytest
-# Pi only: pip install ncnn ; sudo apt install libportaudio2
+# NCNN export (Mac) and inference (Pi): pip install ncnn pnnx ; on the Pi also sudo apt install libportaudio2
