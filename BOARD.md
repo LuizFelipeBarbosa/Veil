@@ -26,5 +26,6 @@ Milestones: 13:00 faces blurred (Mac) | 14:00 owner + signs/plates | 14:45 voice
 | 23 | Ads: stale ad after a scene cut, sliding, glass/occluders | merged 15:36; cut fixed, glass only partly (needs masks) | 15:23–15:31 | wp23-ad-cuts-occlusion | lead: re-watch; panel blurred as a sign after the cut |
 | 8 | Integration (orchestrator) | all threads wired 12:03; live voice test pending | 12:03– | main | lead: hold T and speak |
 | 9 | Pi port (orchestrator + lead) | queued | 14:45–15:30 | main | needs WP8, the Pi |
-| 10 | Leak review (read-only) | queued | 15:30–16:00 | — | needs WP9 |
+| 10 | Leak review (read-only) | done 15:36: no pixel leak; analytics, backfill, mic tail, debug-log fixes merged | 15:23–15:36 | — | residual: swap exposure ~0.9 s, sign labelled as ad is shown |
+| 24 | Mic audio sent for ~120 ms after Talk release | merged 15:45 | 15:37–15:41 | wp24-mic-tail | — |
 | 11 | README and Devpost text | queued | 16:30–17:15 | wp11-readme | needs WP9 |
