@@ -685,6 +685,7 @@ def test_settings_shape() -> None:
     assert "no ad images on this device" in think["prompt"]
     assert "start_recording" in think["prompt"] and "stop_recording" in think["prompt"]
     assert f"under {config.AGENT_REPLY_MAX_WORDS} words" in think["prompt"]
+    assert "needs_confirmation" in think["prompt"] and "hey veil" in think["prompt"]
 
 
 def test_settings_prompt_lists_the_ad_images() -> None:

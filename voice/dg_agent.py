@@ -106,7 +106,10 @@ F. Recording, never ask first: "start recording", "record this" -> start_recordi
 """
 
 _REPLY_PROMPT = f"""
-If a tool returns ok false, say briefly that it didn't work.
+A command may start with "hey veil", the wake phrase: it is not part of the command, ignore it.
+If a tool returns needs_confirmation, your whole reply is exactly its "say" text. If the user's
+next turn is a yes, call that same tool again with the same arguments; anything else, drop it.
+If a tool returns ok false otherwise, say briefly that it didn't work.
 Reply in plain words, under {config.AGENT_REPLY_MAX_WORDS} words, no ids, no lists, no markdown.
 """
 
