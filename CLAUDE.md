@@ -3,9 +3,10 @@ Handheld privacy camera: Raspberry Pi 5 + webcam + touchscreen; built on a MacBo
 Spec: docs/brief.md (source of truth).
 Principles: blur by default, unblur by consent; fail closed; raw frames never leave the device
 and are never written to disk.
-Never write, show or send a raw frame. Mic audio goes only to Deepgram, only while Talk is held.
+Never write, show or send a raw frame. Mic audio goes only to Deepgram, only between
+the wake phrase "hey veil" detected ON THE DEVICE and the end of that turn, or while Talk is held.
 Voice: Deepgram Voice Agent API (Flux STT, hosted OpenAI think model, Aura-2 TTS);
-the 5 tools run client-side on the device.
+the tools in contracts.TOOL_SCHEMAS run client-side on the device.
 Vision: YuNet + SFace + YOLOE-26n with 4 fixed classes (PyTorch on the Mac, NCNN on the Pi).
 Portable: PROFILE = "mac" | "pi" in config.py is the only switch. No Mac-only code paths.
 Keep it light: no new dependency without a DECIDE.

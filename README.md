@@ -4,7 +4,7 @@ A handheld privacy camera. A Raspberry Pi with a USB webcam and a touchscreen sh
 preview and records video in which faces, license plates, street-name signs, house numbers and
 storefront signs are already pixelated. The uncensored image is never shown, never saved and
 never sent anywhere. You control it with on-screen buttons, by tapping a box on the preview, and
-by voice: hold Talk and say "unblur the person on my left", and Deepgram's Voice Agent turns that
+by voice: say "hey veil" (or hold Talk) and then "unblur the person on my left", and Deepgram's Voice Agent turns that
 into a tool call that runs on the device. It can also replace billboards and posters with your
 own ad images, live. Everything was developed and tested on a MacBook first; one setting switches
 it to the Pi.
@@ -20,7 +20,9 @@ Built at VexoHacks. Team: TODO(lead). Demo video: TODO(lead).
   first detection, when a detector falls behind, when anything raises, and in panic.
 - **Raw frames never leave the device and are never written to disk.** Only censored frames
   reach the screen and the recording file.
-- **Mic audio goes only to Deepgram, and only while Talk is held.**
+- **Mic audio goes only to Deepgram, and only for one turn after the wake phrase "hey veil" is
+  detected on the device, or while Talk is held.** Before the wake phrase, audio is processed in
+  memory on the device (Vosk), never stored and never sent. A false wake can send up to 6 s of audio.
 
 ## What it does
 
@@ -31,7 +33,7 @@ Built at VexoHacks. Team: TODO(lead). Demo video: TODO(lead).
 | Remembered people | Someone you unblurred stays unblurred when their track is lost and comes back (up to 16 people, this session only). "Blur all faces" forgets them all. |
 | Objects | License plates, street-name signs, house numbers and storefront signs are pixelated (YOLOE-26n with text prompts). Stop, one-way and other traffic signs are deliberately left alone. |
 | Tap to toggle | Outlines on the preview show what you can tap: blue "blurred", orange "shown", purple "ad". A tap flips blur and show for that one track. Outlines are drawn on the screen only, never into the recording. |
-| Voice | Hold **Talk** (key **T**). Deepgram Voice Agent with 9 client-side tools (below). The reply is spoken and shown as a 3-line transcript. |
+| Voice | Say **"hey veil"** and then the command (a tone plays and the Talk button lights while the mic is live; the turn ends when you stop speaking, or after 6 s), or hold **Talk** (key **T**). After a wake phrase, "unblur everything" and "unblur everyone" ask for a spoken yes first; blur, panic and recording commands never do. "Hey veil, panic" works without a connection. `PRIVACY_CAM_WAKE=0` turns the wake phrase off. Deepgram Voice Agent with 9 client-side tools (below). The reply is spoken and shown as a 3-line transcript. |
 | Panic | **Panic** (key **P**) pixelates the whole frame at the press, with no hold. Clearing it needs a fresh press held for 1 s (or "clear panic"). |
 | Recording | **Record** (key **R**) writes only censored frames, as MJPG `.avi` at 640x480, 15 FPS, video only (no audio track), to `~/privacy-cam-recordings/privacy-cam-YYYYMMDD-HHMMSS.avi`. |
 | Live ad replacement | **Ads** button (key **A**) or voice. Billboards, posters and advertisements are shown by default; switched on, each one is covered with an image from `assets/ads/` (each press goes to the next image, then off). When several ads are in view, the chosen image goes on the first and the others get the next images in the folder, so no two show the same one. The sign's corners are found and the image is warped onto them, then followed from frame to frame with optical flow. Ads are drawn before censoring, so a face in front of an ad is still pixelated on top. |
@@ -216,6 +218,11 @@ TODO(lead): Pi demo status, and which Pi the demo runs on.
 
 ## Known limits
 
+- **Wake phrase.** "hey veil" is spotted on the device with Vosk. It was tuned and measured on
+  synthesized voices only (24 of 24 detected; 2 of 36 near-rhyme decoys such as "the veil is thin"
+  fired); real rooms and the Pi are untested. A false wake sends up to 6 s of audio to Deepgram
+  but cannot unblur anything without a spoken yes. Needs `vosk` and its small English model in the
+  weights folder (`config.VOSK_MODEL`); without them the wake phrase is off and Talk still works.
 - **Short delay.** The delay is a third of a second, by the lead's choice. If someone swaps in
   front of a shown face's track, the new face can be visible for up to about 0.9 s before the
   identity check (every 1 s, with retries) pixelates it again.
