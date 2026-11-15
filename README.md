@@ -33,7 +33,7 @@ Built at VexoHacks by team Veil. Demo video: coming soon.
 | Remembered people | Someone you unblurred stays unblurred when their track is lost and comes back (up to 16 people, this session only). "Blur all faces" forgets them all. |
 | Objects | License plates, street-name signs, house numbers and storefront signs are pixelated (YOLOE-26n with text prompts). Stop, one-way and other traffic signs are deliberately left alone. |
 | Tap to toggle | Outlines on the preview show what you can tap: blue "blurred", orange "shown", purple "ad". A tap flips blur and show for that one track. Outlines are drawn on the screen only, never into the recording. |
-| Voice | Say **"hey veil"** and then the command (a tone plays and the Talk button lights while the mic is live; the turn ends when you stop speaking, or after 6 s), or hold **Talk** (key **T**). After a wake phrase, "unblur everything" and "unblur everyone" ask for a spoken yes first; blur, panic and recording commands never do. "Hey veil, panic" works without a connection. `PRIVACY_CAM_WAKE=0` turns the wake phrase off. Deepgram Voice Agent with 9 client-side tools (below). The reply is spoken and shown as a 3-line transcript. |
+| Voice | Say **"hey veil"** and then the command (a tone plays and the Talk button lights while the mic is live; the turn ends when you stop speaking, or after 6 s), or hold **Talk** (key **T**). A spoken-yes confirmation for "unblur everything" and "unblur everyone" after a wake phrase exists but is switched off (`config.WAKE_REVEAL_NEEDS_YES`). "Hey veil, panic" works without a connection. `PRIVACY_CAM_WAKE=0` turns the wake phrase off. Deepgram Voice Agent with 9 client-side tools (below). The reply is spoken and shown as a 3-line transcript. |
 | Panic | **Panic** (key **P**) pixelates the whole frame at the press, with no hold. Clearing it needs a fresh press held for 1 s (or "clear panic"). |
 | Recording | **Record** (key **R**) writes only censored frames, as MJPG `.avi` at 640x480, 15 FPS, video only (no audio track), to `~/privacy-cam-recordings/privacy-cam-YYYYMMDD-HHMMSS.avi`. |
 | Live ad replacement | **Ads** button (key **A**) or voice. Billboards, posters and advertisements are shown by default; switched on, each one is covered with an image from `assets/ads/` (each press goes to the next image, then off). When several ads are in view, the chosen image goes on the first and the others get the next images in the folder, so no two show the same one. The sign's corners are found and the image is warped onto them, then followed from frame to frame with optical flow. Ads are drawn before censoring, so a face in front of an ad is still pixelated on top. |
@@ -220,8 +220,9 @@ TODO(lead): Pi demo status, and which Pi the demo runs on.
 
 - **Wake phrase.** "hey veil" is spotted on the device with Vosk. It was tuned and measured on
   synthesized voices only (24 of 24 detected; 2 of 36 near-rhyme decoys such as "the veil is thin"
-  fired); real rooms and the Pi are untested. A false wake sends up to 6 s of audio to Deepgram
-  but cannot unblur anything without a spoken yes. Needs `vosk` and its small English model in the
+  fired); real rooms and the Pi are untested. A false wake sends up to 6 s of audio to Deepgram,
+  and with the yes confirmation switched off (the default, `config.WAKE_REVEAL_NEEDS_YES`) a
+  misheard "unblur everything" after it would run. Needs `vosk` and its small English model in the
   weights folder (`config.VOSK_MODEL`); without them the wake phrase is off and Talk still works.
 - **Short delay.** The delay is a third of a second, by the lead's choice. If someone swaps in
   front of a shown face's track, the new face can be visible for up to about 0.9 s before the
