@@ -63,9 +63,13 @@ def main() -> None:
         ToolHandlers(policy, pipeline.scene, ad_assets=ad_assets, recorder=recorder), on_transcript, use_audio=not args.no_audio
     )
 
+    def current_ad() -> str | None:
+        """The image replacing ads right now, whichever ad class it was set on (voice may set just one)."""
+        return next(iter(policy.snapshot().replacements.values()), None)
+
     def cycle_ad() -> None:
         """Key A: off -> first ad image -> next -> ... -> off, for every ad class at once."""
-        current = policy.snapshot().replacements.get(AD_CLASSES[0])
+        current = current_ad()
         following = ad_assets[ad_assets.index(current) + 1 :] if current in ad_assets else ad_assets
         for label in AD_CLASSES:
             if following:
@@ -101,7 +105,7 @@ def main() -> None:
             talking=talk_held.is_set() or voice.mic_live,  # lit whenever mic audio is being sent
             transcript=tuple(transcript) if opacity > 0 else (),  # gone: the pointing hint comes back
             transcript_opacity=opacity,
-            ad=Path(next(iter(policy.snapshot().replacements.values()), "")).stem,
+            ad=Path(current_ad() or "").stem,
             owner_enrolled=pipeline.owner_enrolled,
         )
 
