@@ -28,7 +28,7 @@ Milestones: 13:00 faces blurred (Mac) | 14:00 owner + signs/plates | 14:45 voice
 | 26 | Ghost faces on the bus-stop advert: rotated passes firing on printed ads | merged 16:03 (lead accepted the recall trade) | 15:47–16:00 | wp26-ghost-faces | a face turned past 90° beside a sure upright face can be missed |
 | 28 | Voice tools start_recording / stop_recording | merged 16:33; live 52/54, 'Blur her again' asked instead of acting once (known flake since WP14, passed on re-run) | 16:24–16:31 | wp28-recording-tools | — |
 | 29 | Wake phrase "hey veil" on-device (vosk), one-turn mic, spoken yes for reveal commands | merged 16:36; unit-tested only | 16:27–16:34 | wp29-wake-phrase | lead: live test with a real voice; Pi untested |
-| 30 | Prompt lines for the confirmation flow | running, due 16:50 | 16:37– | wp30-confirm-prompt | — |
+| 30 | Prompt lines for the confirmation flow | merged 16:43; live 53/54 | 16:37–16:41 | wp30-confirm-prompt | 'Blur her again' asked instead of acting in 2 of the last 3 live runs |
 | 8 | Integration (orchestrator) | all threads wired 12:03; live voice test pending | 12:03– | main | lead: hold T and speak |
 | 9 | Pi port (orchestrator + lead) | queued | 14:45–15:30 | main | needs WP8, the Pi |
 | 10 | Leak review (read-only) | done 15:36: no pixel leak; analytics, backfill, mic tail, debug-log fixes merged | 15:23–15:36 | — | residual: swap exposure ~0.9 s, sign labelled as ad is shown |
