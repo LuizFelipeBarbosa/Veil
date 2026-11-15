@@ -485,17 +485,15 @@ def _composite(
     cv2.fillConvexPoly(mask, np.round(local).astype(np.int32), 255)
 
     sign.tone = _tone(scene, mask, sign.tone)
-    black, white = sign.tone
-    ad = cv2.GaussianBlur(warped, (0, 0), _SOFTEN_SIGMA).astype(np.float32)
-    ad = ad * ((white - black) / 255.0) + black
-    ad += grain[y1:y2, x1:x2, None]
-    ad *= _shading(scene)[..., None]
+    black, white = (float(level) for level in sign.tone)
+    ad = cv2.convertScaleAbs(cv2.GaussianBlur(warped, (0, 0), _SOFTEN_SIGMA), alpha=(white - black) / 255.0, beta=black)
+    ad = cv2.add(ad, cv2.cvtColor(grain[y1:y2, x1:x2], cv2.COLOR_GRAY2BGR), dtype=cv2.CV_8U)
+    ad = cv2.multiply(ad, cv2.cvtColor(_shading(scene), cv2.COLOR_GRAY2BGR), dtype=cv2.CV_8U)
 
     # Half the fade falls a pixel or two outside the quad, still inside the box: shrinking the ad instead
     # left a rim of the old poster around it.
-    alpha = (cv2.GaussianBlur(mask, (0, 0), _FEATHER_SIGMA).astype(np.float32) / 255.0)[..., None]
-    blended = scene * (1.0 - alpha) + ad * alpha
-    out[y1:y2, x1:x2] = np.clip(blended + 0.5, 0, 255).astype(np.uint8)
+    alpha = cv2.GaussianBlur(mask, (0, 0), _FEATHER_SIGMA).astype(np.float32) / 255.0
+    out[y1:y2, x1:x2] = cv2.blendLinear(ad, scene, alpha, 1.0 - alpha)
 
 
 def _letterbox(asset: np.ndarray, quad: np.ndarray) -> np.ndarray:
