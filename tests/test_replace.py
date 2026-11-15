@@ -394,3 +394,107 @@ def test_a_sign_without_a_fresh_box_for_the_hold_over_is_dropped(ads_dir: Path) 
         assert _is_ad(replacer.draw(image, [held], ASSETS, now=now)[50:200, 100:300]).mean() > 0.99
     for now in (config.HOLD_OVER_S + 0.05, config.HOLD_OVER_S + 0.1):  # dropped, and not restarted from that box
         assert not _is_ad(replacer.draw(image, [held], ASSETS, now=now)).any()
+
+
+# --- WP27: signs seen together show different images ---
+
+
+COLOURS = {"a.png": (0, 0, 255), "b.png": (0, 255, 0), "c.png": (255, 0, 0), "d.png": (255, 255, 0)}  # BGR, flat
+SIGN_BOXES = [(40, 40, 200, 160), (300, 40, 460, 160), (40, 300, 200, 420)]  # far apart: separate signs
+
+
+@pytest.fixture
+def colour_dir(tmp_path: Path) -> Path:
+    for name, colour in COLOURS.items():
+        cv2.imwrite(str(tmp_path / name), np.full((150, 200, 3), colour, dtype=np.uint8))
+    return tmp_path
+
+
+def _shown(out: np.ndarray, xyxy: tuple[int, int, int, int]) -> str | None:
+    """The image drawn on the box, by the colour at its centre; None when nothing is."""
+    pixel = out[(xyxy[1] + xyxy[3]) // 2, (xyxy[0] + xyxy[2]) // 2]
+    return next((name for name, colour in COLOURS.items() if np.abs(pixel.astype(int) - colour).max() <= 2), None)
+
+
+def _draw_signs(replacer: AdReplacer, signs: list[tuple[int, int, int, int]], chosen: str, step: int) -> list[str | None]:
+    """One frame with a box on each sign, jittering a few px, with a new track id and label every frame."""
+    image = np.zeros((HEIGHT, WIDTH, 3), np.uint8)  # no edges: each box is its sign's quad
+    jitter = 6 if step % 2 else -6
+    boxes = [
+        _box((x1 + jitter, y1 - jitter, x2 + jitter, y2 + jitter), f"obj#{step}-{k}",
+             ("poster", "billboard")[(step + k) % 2], last_seen=step * 0.07)
+        for k, (x1, y1, x2, y2) in enumerate(signs)
+    ]
+    out = replacer.draw(image, boxes, {"poster": chosen, "billboard": chosen}, now=step * 0.07)
+    return [_shown(out, xyxy) for xyxy in signs]
+
+
+def test_two_signs_together_show_different_images_the_chosen_one_first(colour_dir: Path) -> None:
+    assert _draw_signs(AdReplacer(colour_dir), SIGN_BOXES[:2], "b.png", step=0) == ["b.png", "c.png"]
+
+
+def test_each_sign_keeps_its_image_over_jitter_and_changing_tracks(colour_dir: Path) -> None:
+    replacer = AdReplacer(colour_dir)
+    for step in range(20):
+        assert _draw_signs(replacer, SIGN_BOXES[:2], "a.png", step) == ["a.png", "b.png"]
+
+
+def test_a_third_sign_takes_the_next_image_and_leaves_the_others(colour_dir: Path) -> None:
+    replacer = AdReplacer(colour_dir)
+    for step in range(3):
+        _draw_signs(replacer, SIGN_BOXES[:2], "c.png", step)
+    for step in range(3, 8):
+        assert _draw_signs(replacer, SIGN_BOXES, "c.png", step) == ["c.png", "d.png", "a.png"]  # wraps around
+    for step in range(8, 10):  # the first one leaves the view: the others keep theirs
+        assert _draw_signs(replacer, SIGN_BOXES[1:], "c.png", step) == ["d.png", "a.png"]
+
+
+def test_a_new_sign_takes_the_first_image_no_living_sign_shows(colour_dir: Path) -> None:
+    replacer = AdReplacer(colour_dir)
+    black = np.zeros((HEIGHT, WIDTH, 3), np.uint8)
+    replacer.draw(black, [_box(SIGN_BOXES[0], "obj#1"), _box(SIGN_BOXES[1], "obj#2")], {"poster": "a.png"}, now=0.0)
+    for now in (0.5 * config.HOLD_OVER_S, config.HOLD_OVER_S + 0.1):  # the first sign expires, the second is seen
+        replacer.draw(black, [_box(SIGN_BOXES[1], "obj#2", last_seen=now)], {"poster": "a.png"}, now=now)
+    boxes = [_box(SIGN_BOXES[1], "obj#2", last_seen=now + 0.07), _box(SIGN_BOXES[2], "obj#3", last_seen=now + 0.07)]
+    out = replacer.draw(black, boxes, {"poster": "a.png"}, now=now + 0.07)
+    assert [_shown(out, SIGN_BOXES[1]), _shown(out, SIGN_BOXES[2])] == ["b.png", "a.png"]
+
+
+def test_changing_the_chosen_image_picks_again_with_the_new_one_on_the_established_sign(colour_dir: Path) -> None:
+    replacer = AdReplacer(colour_dir)
+    _draw_signs(replacer, SIGN_BOXES[:1], "a.png", step=0)  # the first sign is the established one
+    for step in range(1, 4):
+        assert _draw_signs(replacer, SIGN_BOXES[:2], "a.png", step) == ["a.png", "b.png"]
+    for step in range(4, 8):
+        assert _draw_signs(replacer, SIGN_BOXES[:2], "c.png", step) == ["c.png", "d.png"]
+
+
+def test_with_one_image_every_sign_shows_it(ads_dir: Path) -> None:
+    boxes = [_box(xyxy, f"obj#{k}") for k, xyxy in enumerate(SIGN_BOXES)]
+    out = AdReplacer(ads_dir).draw(np.zeros((HEIGHT, WIDTH, 3), np.uint8), boxes, ASSETS, now=0.0)
+    for x1, y1, x2, y2 in SIGN_BOXES:
+        assert _is_ad(out[y1:y2, x1:x2]).mean() > 0.99
+
+
+def test_an_unreadable_image_is_skipped_by_the_others_but_never_stands_in_for_the_chosen_one(colour_dir: Path) -> None:
+    (colour_dir / "b2.png").write_bytes(b"not an image")  # sorted right after b.png
+    assert _draw_signs(AdReplacer(colour_dir), SIGN_BOXES, "b.png", step=0) == ["b.png", "c.png", "d.png"]
+    assert _draw_signs(AdReplacer(colour_dir), SIGN_BOXES, "b2.png", step=0) == [None, None, None]
+
+
+def test_the_directory_is_rescanned_only_for_a_name_not_in_it(colour_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    scans: list[Path] = []
+
+    def counted(directory: Path) -> tuple[str, ...]:
+        scans.append(directory)
+        return list_assets(directory)
+
+    monkeypatch.setattr(replace, "list_assets", counted)
+    replacer = AdReplacer(colour_dir)
+    for step in range(5):
+        _draw_signs(replacer, SIGN_BOXES[:2], "a.png", step)
+    assert len(scans) == 1  # at construction
+    cv2.imwrite(str(colour_dir / "e.png"), np.full((150, 200, 3), 128, np.uint8))
+    for step in range(5, 10):
+        _draw_signs(replacer, SIGN_BOXES[:2], "e.png", step)
+    assert len(scans) == 2  # once for the new name, not every frame

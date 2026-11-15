@@ -7,6 +7,7 @@ and blurred objects on top of it, so nothing here may skip censoring or keep the
 from __future__ import annotations
 
 import logging
+from collections import Counter
 from pathlib import Path
 from typing import Mapping, Sequence
 
@@ -100,7 +101,8 @@ class _Sign:
         self.candidate: np.ndarray | None = None  # a box-started sign's last found quad, moved with the flow
         # Where it may be drawn: its last fresh box, moved with the flow since (see AdReplacer.draw).
         self.region = np.float32(xyxy)
-        self.asset_name = ""
+        self.label = box.label  # of the newest box supporting it: whose chosen image it starts its rotation from
+        self.asset_name = ""  # its own image, kept while it lives (see AdReplacer._pick)
         self.seen = box.last_seen  # last_seen of the newest box supporting it (the detector's clock)
         self.updated = now  # when that box first reached draw() (draw's clock): the hold-over counts from here
         self.support = 0  # frames with a supporting box: the established sign wins an overlap
@@ -108,6 +110,9 @@ class _Sign:
 
 class AdReplacer:
     """Warps an ad image onto each replaced sign, following each sign with optical flow.
+
+    Signs seen together show different images: the most established one shows the image chosen for its
+    label, the others the next images in the ads directory after it (sorted, wrapping around).
 
     Keeps the loaded ad images, each sign's corners, a 16 x 12 thumbnail of the last frame (to notice
     scene cuts) and the last frame as a downscaled grayscale image for the optical flow. That grayscale
@@ -117,6 +122,8 @@ class AdReplacer:
 
     def __init__(self, directory: Path = config.ADS_DIR) -> None:
         self._directory = directory
+        self._names = list_assets(directory)  # rescanned only when the operator names a file not in it
+        self._chosen: dict[str, str] = {}  # the label -> file name mapping the signs' images were picked for
         self._assets: dict[str, np.ndarray | None] = {}  # None: missing or unreadable, logged once
         self._signs: list[_Sign] = []
         self._thumbnail: np.ndarray | None = None
@@ -148,6 +155,8 @@ class AdReplacer:
         expired = [sign for sign in self._signs if now - sign.updated > config.HOLD_OVER_S]
         self._stale_until = max([self._stale_until, *(sign.seen for sign in expired)])  # its held-over boxes too
         self._signs = [sign for sign in self._signs if sign not in expired]
+        if assets != self._chosen:
+            self._choose(assets)
 
         lost = {id(sign) for sign in self._signs if previous_gray is None or not _follow(sign, previous_gray, gray)}
         supported: list[_Sign] = []
@@ -159,10 +168,11 @@ class AdReplacer:
             sign = max(candidates, key=lambda s: _overlap(_bounds(s.corners), xyxy), default=None)
             if sign is None or _overlap(_bounds(sign.corners), xyxy) < _MIN_SAME_SIGN_OVERLAP:
                 sign = _Sign(_find_quad(image, xyxy), box, xyxy, now)
+                sign.asset_name = self._pick(assets[box.label], self._signs)
                 self._signs.append(sign)
             elif box.last_seen > sign.seen or id(sign) in lost:  # correct the flow; a lost sign restarts at its box
                 _correct(sign, image, xyxy, restart=id(sign) in lost)
-            sign.asset_name = assets[box.label]
+            sign.label = box.label
             if box.last_seen > sign.seen:
                 sign.seen, sign.updated = box.last_seen, now
             sign.support += 1
@@ -178,9 +188,31 @@ class AdReplacer:
                 continue
             drawn.append(sign)
             region = _clipped(_rounded(sign.region), width, height)
-            if region[2] - region[0] >= 2 and region[3] - region[1] >= 2:
-                _warp_into_box(out, image, self._asset(sign.asset_name), sign.corners, region)
+            asset = self._asset(sign.asset_name)
+            if asset is not None and region[2] - region[0] >= 2 and region[3] - region[1] >= 2:
+                _warp_into_box(out, image, asset, sign.corners, region)
         return out
+
+    def _choose(self, assets: Mapping[str, str]) -> None:
+        """The operator's mapping changed: every living sign picks again, the most established first,
+        so that one shows the new choice and the others follow it."""
+        self._chosen = dict(assets)
+        if any(name not in self._names for name in assets.values()):
+            self._names = list_assets(self._directory)
+        picked: list[_Sign] = []
+        for sign in sorted(self._signs, key=lambda s: s.support, reverse=True):
+            sign.asset_name = self._pick(assets.get(sign.label, ""), picked)
+            picked.append(sign)
+
+    def _pick(self, chosen: str, others: Sequence[_Sign]) -> str:
+        """A new sign's image: the first in the rotation from `chosen` that none of `others` shows;
+        when all are shown, the least shown, again in rotation order. The rotation is `chosen` (even
+        when unreadable: it is never silently replaced) then the readable images after it, wrapping."""
+        start = self._names.index(chosen) + 1 if chosen in self._names else 0
+        following = self._names[start:] + self._names[:start]
+        rotation = [chosen, *(name for name in following if name != chosen and self._asset(name) is not None)]
+        shown = Counter(sign.asset_name for sign in others)
+        return min(rotation, key=lambda name: shown[name])  # the first of the least shown
 
     def _scene_cut(self, image: np.ndarray) -> bool:
         """Whether most of the frame changed since the last call; remembers this frame's thumbnail."""
