@@ -120,4 +120,15 @@ DEEPGRAM_KEYTERMS = (
     "blur", "unblur", "pixelate", "panic", "faces", "license plate", "street sign", "house number",
 )
 KEYWORD_FALLBACK_S = 2.0  # no tool call this long after end of turn: run the keyword parser
+
+# --- wake phrase (on-device, Vosk) ---
+# Mic audio leaves the device only between a wake phrase detected ON THE DEVICE and the end of
+# that turn (or while Talk is held). Before the wake phrase, audio is processed in memory only.
+WAKE_PHRASE_ENABLED = os.environ.get("PRIVACY_CAM_WAKE", "1") != "0"  # False: Talk button and key T only
+WAKE_PHRASE = "hey veil"
+VOSK_MODEL = WEIGHTS_DIR / "vosk-model-small-en-us-0.15"
+WAKE_STABLE_BLOCKS = 4  # the phrase must stay in the recognizer's guess this many 50 ms blocks in a row
+WAKE_TURN_SILENCE_S = 6.0  # after a wake, the mic closes when the turn ends or after this much silence
+WAKE_TONE_HZ = 880
+WAKE_TONE_S = 0.12
 AGENT_REPLY_MAX_WORDS = 8

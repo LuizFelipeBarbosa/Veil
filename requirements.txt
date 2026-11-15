@@ -6,3 +6,4 @@ sounddevice
 deepgram-sdk
 pytest
 # NCNN export (Mac) and inference (Pi): pip install ncnn pnnx ; on the Pi also sudo apt install libportaudio2
+vosk==0.3.44  # on-device wake phrase ("hey veil"); lead approved 16:27
