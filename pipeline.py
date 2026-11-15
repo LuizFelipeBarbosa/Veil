@@ -21,8 +21,8 @@ import numpy as np
 import config
 from capture import CaptureThread, FrameSource, RingBuffer
 from contracts import (
-    CENSORED_OBJECT_CLASSES, EMPTY_SCENE, FACE, REPLACE, Action, BufferedFrame, CensoredFrame, Highlight, Policy,
-    PolicySnapshot, Scene, TrackedBox,
+    AD_CLASSES, CENSORED_OBJECT_CLASSES, EMPTY_SCENE, FACE, REPLACE, Action, BufferedFrame, CensoredFrame, Highlight,
+    Policy, PolicySnapshot, Scene, TrackedBox,
 )
 from recorder import Recorder
 from vision import policy as policy_rules
@@ -65,6 +65,10 @@ class _Throughput:
 
 _FRAME_WAIT_S = 0.1
 _SIGN_INSIDE_AD_SHARE = 0.8  # of the sign box's area; see Pipeline._with_ads
+# Two object tracks of one family (both ads, or the same label) sharing this much of the smaller box are
+# one object tracked twice: the operator sees and points at one highlight for the stack.
+_STACK_SHARE = 0.5
+_MOST_CENSORED_FIRST = ("blur", REPLACE, "show")
 
 
 def fail_closed_frame(image: np.ndarray, index: int) -> CensoredFrame:
@@ -105,6 +109,7 @@ class Pipeline(threading.Thread):
         self._object_hold_over = render.HoldOver(config.HOLD_OVER_S + config.OBJECT_MIN_PERIOD_S)
         self._ads = AdReplacer()
         self._confirmed_ad_ids: set[str] = set()
+        self._stacks: dict[str, tuple[str, ...]] = {}  # shown highlight id -> the tracks stacked under it
         self._last_object_result_index = -1
         self._seen_track_ids: set[str] = set()
         self._confirmed_face_ids: set[str] = set()
@@ -140,7 +145,8 @@ class Pipeline(threading.Thread):
             return None
         target = min(under_pointer, key=lambda h: (h.xyxy[2] - h.xyxy[0]) * (h.xyxy[3] - h.xyxy[1]))
         action: Action = "blur" if target.state == "show" else "show"
-        self._policy.set_track_override(target.id, action)
+        for track_id in (target.id, *self._stacks.get(target.id, ())):  # the whole stack flips together
+            self._policy.set_track_override(track_id, action)
         log.info("pointed at %s (%s): %s", target.id, target.label, action)
         return target.id
 
@@ -357,7 +363,8 @@ class Pipeline(threading.Thread):
             for box in frame.boxes
             if box.label != FACE or box.conf >= config.SCENE_MIN_CONF
         }
-        return tuple(by_id.values())
+        shown, self._stacks = _one_per_stack(list(by_id.values()))
+        return tuple(shown)
 
     def _decide(self, box: TrackedBox, policy: PolicySnapshot) -> Action:
         """policy.decide, except that an owner mark is void once its track failed the ID re-check.
@@ -368,6 +375,41 @@ class Pipeline(threading.Thread):
         if box.is_owner and box.frame_index <= self._owner_lost_at.get(box.id, -1):
             box = dataclasses.replace(box, is_owner=False)
         return policy_rules.decide(box, policy)
+
+
+def _one_per_stack(highlights: list[Highlight]) -> tuple[list[Highlight], dict[str, tuple[str, ...]]]:
+    """One highlight per object, and for each shown id the ids of the tracks stacked under it.
+
+    Display and pointing only: every box is still censored by its own decision. The largest box of a
+    stack is shown, with the most censored state among its members, so a stack that is partly pixelated
+    reads as blurred. Faces are never stacked: each face keeps its own highlight.
+    """
+    shown: list[Highlight] = []
+    stacks: dict[str, list[Highlight]] = {}
+    for highlight in sorted(highlights, key=lambda h: _box_area(h.xyxy), reverse=True):
+        under = next((top for top in shown if _same_object(highlight, top)), None)
+        if under is None:
+            shown.append(highlight)
+            stacks[highlight.id] = []
+        else:
+            stacks[under.id].append(highlight)
+    merged = [
+        dataclasses.replace(top, state=min((top.state, *(h.state for h in stacks[top.id])), key=_MOST_CENSORED_FIRST.index))
+        for top in shown
+    ]
+    return merged, {top_id: tuple(h.id for h in members) for top_id, members in stacks.items() if members}
+
+
+def _same_object(a: Highlight, b: Highlight) -> bool:
+    if FACE in (a.label, b.label):
+        return False
+    same_family = a.label == b.label or (a.label in AD_CLASSES and b.label in AD_CLASSES)
+    smaller, larger = sorted((a.xyxy, b.xyxy), key=_box_area)
+    return same_family and _share_inside(smaller, larger) >= _STACK_SHARE
+
+
+def _box_area(xyxy: tuple[int, int, int, int]) -> int:
+    return max(0, xyxy[2] - xyxy[0]) * max(0, xyxy[3] - xyxy[1])
 
 
 def _share_inside(inner: tuple[int, int, int, int], outer: tuple[int, int, int, int]) -> float:
