@@ -34,7 +34,7 @@ The loop, repeated all day:
 
 ## Work packages
 
-Eleven packages, timed to the milestones. At most 3 implementers run at once, and the next package starts as a slot frees up. The nine never-leaks rules in the Brief are part of the done-when for every vision package, and WP10 checks all of them.
+Thirteen packages, timed to the milestones. At most 3 implementers run at once, and the next package starts as a slot frees up. The nine never-leaks rules in the Brief are part of the done-when for every vision package, and WP10 checks all of them.
 
 | WP | Package | Owns | Needs | Slot | Done when |
 | --- | --- | --- | --- | --- | --- |
@@ -49,6 +49,8 @@ Eleven packages, timed to the milestones. At most 3 implementers run at once, an
 | 9 | Pi port (orchestrator + you) | `config.py` Pi profile, setup notes in `README.md` | 8 | 14:45–15:30 | On the Pi: fullscreen app on the touchscreen, NCNN model loaded, 15 FPS for 2 minutes without throttling (or 10 FPS fallback), a recording plays back censored, one voice command works |
 | 10 | Leak review (read-only) | report only | 9 | 15:30–16:00 | Written list of every path where a raw frame can reach the screen or disk; each becomes a bug-fix package |
 | 11 | README and Devpost text | `README.md` | 9 | 16:30–17:15 | Setup, architecture and principles match the code; you edit and submit |
+| 12 | Live ad replacement | `vision/replace.py`, `assets/ads/`, replacement tests | 2, 5 | 14:35–15:35, alongside WP8 and WP9 | On the Mac: a poster at 1–3 m is replaced by the chosen image in the preview and the recording, corners steady, faces in front still pixelated; `set_replacement` works by voice; the NCNN export includes the 3 ad classes |
+| 13 | Clips | `clipper.py` and its tests; the orchestrator wires the Clip button, key C and the `save_clip` tool | 1, 3 | 14:40–15:20 | Voice "clip that", the Clip button and key C each save the last 30 s of censored frames to `recordings/clips/` without stalling the preview; a clip made while not recording plays back; a test shows the buffer never receives a raw frame |
 
 ## Templates
 
@@ -133,8 +135,8 @@ Principles: blur by default, unblur by consent; fail closed; raw frames never le
 and are never written to disk.
 Never write, show or send a raw frame. Mic audio goes only to Deepgram, only while Talk is held.
 Voice: Deepgram Voice Agent API (Flux STT, hosted OpenAI think model, Aura-2 TTS);
-the 5 tools run client-side on the device.
-Vision: YuNet + SFace + YOLOE-26n with 4 fixed classes (PyTorch on the Mac, NCNN on the Pi).
+the 7 tools run client-side on the device.
+Vision: YuNet + SFace + YOLOE-26n with 7 fixed classes (PyTorch on the Mac, NCNN on the Pi).
 Portable: PROFILE = "mac" | "pi" in config.py is the only switch. No Mac-only code paths.
 Keep it light: no new dependency without a DECIDE.
 Key from env: DEEPGRAM_API_KEY. Never commit it.

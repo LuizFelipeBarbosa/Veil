@@ -1,6 +1,6 @@
 # Privacy Camera: Project Brief
 
-Updated 2026-11-14, 11:20
+Updated 2026-11-14, 14:40
 
 A handheld privacy camera on a Raspberry Pi 5 with a webcam and a touchscreen. It records video with faces, street signs and license plates already pixelated, so raw footage never exists on disk, and you control it by voice through Deepgram's Voice Agent API. We build it on the MacBook first, then move it to the Pi. Building starts at 11:20, features freeze at 16:00, and the submission is due at 17:45. **This file is the source of truth. `docs/claude-code-plan.md` covers how we build it.**
 
@@ -8,7 +8,7 @@ A handheld privacy camera on a Raspberry Pi 5 with a webcam and a touchscreen. I
 
 **The problem.** Anyone filming in public captures bystanders who never agreed to be filmed, plus street signs, plates and house numbers that reveal where they are. Blurring afterwards means the raw footage exists first, and raw footage leaks.
 
-**The product.** A camera app on the Pi's touchscreen. It shows a censored live preview, records only censored video, and takes voice commands: "Blur all faces." "Unblur the person on my left, she's with me." Deepgram's Voice Agent hears the command, its hosted OpenAI model decides, and tool calls change a local policy engine. The agent answers out loud and on screen.
+**The product.** A camera app on the Pi's touchscreen. It shows a censored live preview, records only censored video, and takes voice commands: "Blur all faces." "Unblur the person on my left, she's with me." Deepgram's Voice Agent hears the command, its hosted OpenAI model decides, and tool calls change a local policy engine. The agent answers out loud and on screen. It can also swap billboards and posters for your own ad images, live. Say "clip that" and it saves the last 30 seconds as its own file.
 
 **Three principles:**
 
@@ -18,13 +18,13 @@ A handheld privacy camera on a Raspberry Pi 5 with a webcam and a touchscreen. I
 
 **Scope.** Recordings are video only, with no audio track, and there is no livestreaming for now.
 
-**The demo.** Hold the Pi and tap Record. A teammate walks into frame and is blurred; a plate and a street sign on a phone screen are blurred. Hold Talk and say "unblur the person on my left": only she appears. Hold Panic: everything pixelates. Stop, then play the recording back: only censored footage exists.
+**The demo.** Hold the Pi and tap Record. A teammate walks into frame and is blurred; a plate and a street sign on a phone screen are blurred. Hold Talk and say "unblur the person on my left": only she appears. Say "replace the poster with my ad": the poster on the wall becomes your ad. Hold Panic: everything pixelates. Stop, then play the recording back: only censored footage exists.
 
 ## How it works
 
 Two loops meet at one policy engine. The **video loop** runs every frame and decides what gets pixelated. The **voice loop** runs only while you hold Talk, and all it can do is change the policy.
 
-1. **Video loop.** Webcam → 15-frame delay buffer (1 s at 15 FPS) → YuNet faces every frame, YOLOE-26 nano (4 fixed classes) on its own thread → ByteTrack IDs, SFace marks the owner → the policy decides blur or show per box → pixelate → the touchscreen preview and, while recording, the video file.
+1. **Video loop.** Webcam → 15-frame delay buffer (1 s at 15 FPS) → YuNet faces every frame, YOLOE-26 nano (7 fixed classes) on its own thread → ByteTrack IDs, SFace marks the owner → the policy decides blur or show per box → pixelate → the touchscreen preview and, while recording, the video file.
 2. **Voice loop.** Hold Talk (on screen, or T on the Mac) → mic audio streams to Deepgram's Voice Agent → release sends `ForceEndTurn` → Flux transcribes → the hosted OpenAI model calls `get_scene`, then the policy tools, which run on the device → Aura-2 confirms out loud and the reply shows on screen.
 
 One Python 3.11 process. Threads share two objects: the `Policy` (behind a lock) and the latest `Scene`.
@@ -81,12 +81,12 @@ Every vision model runs on the device. Only voice goes to the cloud (Deepgram, w
 | Camera in | OpenCV `VideoCapture` | Mac: built-in camera. Pi: USB webcam. 640×480 @ 15 FPS | 10 FPS |
 | Faces | YuNet, `face_detection_yunet_2023mar.onnx` | Score 0.6, every frame; input 640×480 on Mac, 320×240 on Pi | Score 0.5 |
 | Owner ID | SFace, `face_recognition_sface_2021dec.onnx` | Cosine ≥ 0.363 is a match | Tap a face on screen to mark it as the owner |
-| Signs, plates | YOLOE-26 nano, 4 fixed classes | Mac: PyTorch on `mps`, 640 px. Pi: NCNN export, 320 px. Own thread, confidence 0.25 | 256 px, or every other frame |
+| Signs, plates | YOLOE-26 nano, 7 fixed classes | Mac: PyTorch on `mps`, 640 px. Pi: NCNN export, 320 px. Own thread, confidence 0.25 | 256 px, or every other frame |
 | Tracking | `trackers` `ByteTrackTracker`, one for faces, one for objects | IDs `face#n`, `obj#n` | Hold last boxes 0.5 s |
 | Censoring | OpenCV pixelate | 16×16 px blocks, boxes padded 20% | Solid black box |
 | App and preview | pygame, fullscreen on the Pi | Buttons: Record, hold Talk, hold Panic 1 s; status dot; agent transcript. Mac keys: R, T, P | — |
 | Recording | OpenCV `VideoWriter`, MJPG `.avi` | 640×480 @ 15 FPS into `~/privacy-cam-recordings/`. The Pi 5 has no hardware H.264 encoder, so MJPG keeps the CPU free | Convert to MP4 on the Mac with ffmpeg for sharing |
-| Voice | Deepgram Voice Agent API via `deepgram-sdk` | Flux `flux-general-en` with keyterms; OpenAI model hosted by Deepgram, temperature 0; Aura-2 voice; 5 client-side functions; audio only while Talk is held | Keyword parser on the transcript if no tool call within 2 s; own OpenAI key if the hosted model isn't on our plan |
+| Voice | Deepgram Voice Agent API via `deepgram-sdk` | Flux `flux-general-en` with keyterms; OpenAI model hosted by Deepgram, temperature 0; Aura-2 voice; 7 client-side functions; audio only while Talk is held | Keyword parser on the transcript if no tool call within 2 s; own OpenAI key if the hosted model isn't on our plan |
 | Audio I/O | `sounddevice` | 16 kHz mono in; agent audio out to headphones (Mac) or speaker (Pi) | Text-only replies on screen |
 
 **Install:** `ultralytics`, `opencv-python`, `trackers`, `pygame`, `sounddevice`, `deepgram-sdk`, `pytest`; on the Pi also `ncnn` and `sudo apt install libportaudio2`. One key: `DEEPGRAM_API_KEY`. Exporting YOLOE freezes its prompt classes, so voice can blur or show the 4 known classes, faces and individual tracks, but it can't add new object types.
@@ -112,7 +112,9 @@ These shapes live in `contracts.py`. Only the orchestrator changes them.
 ```json
 {
   "class_rules": {"face": "blur", "license plate": "blur", "street sign": "blur",
-                  "house number": "blur", "storefront sign": "blur"},
+                  "house number": "blur", "storefront sign": "blur",
+                  "billboard": "replace", "poster": "show", "advertisement": "show"},
+  "replacements": {"billboard": "coffee.png"},
   "track_overrides": {"face#7": "show"},
   "panic": false
 }
@@ -141,10 +143,12 @@ Sides are worked out relative to the owner, with one config flag for camera orie
 | Tool | Arguments | Effect |
 | --- | --- | --- |
 | `get_scene` | none | Returns the Scene above; no state change |
-| `set_class_rule` | `label` (one of the 5 known classes), `action` (`blur` or `show`) | Changes a class rule |
+| `set_class_rule` | `label` (one of the known classes), `action` (`blur` or `show`) | Changes a class rule |
 | `set_track` | `track_id` (from the scene), `action` | Overrides one track |
 | `blur_all` | none | Panic on |
 | `clear_panic` | none | Panic off |
+| `set_replacement` | `label` (`billboard`, `poster` or `advertisement`), `asset` (a file in `assets/ads/`) | Paints that image over every sign of that class; `set_class_rule` turns it off |
+| `save_clip` | `seconds` (default 30, max 60) | Saves the last N seconds of censored video as a clip; no policy change |
 
 **Agent prompt rules:** call `get_scene` before any command about specific people or objects; use only IDs from that scene; if two people fit, ask out loud instead of guessing; if asked to hide a type it doesn't know, say which types it can hide; keep spoken replies under 8 words.
 
@@ -158,6 +162,29 @@ Sides are worked out relative to the owner, with one config flag for camera orie
 | "Blur everything." | `blur_all()` |
 | "Unblur the guy." (two candidates) | `get_scene()`, then asks: "The one on your left or the one in the back?" |
 | "Hide the logos." | Says it can hide faces, plates, street signs, house numbers and storefronts |
+
+## Live ad replacement
+
+Added at 14:35. The camera finds billboards and posters and paints your own ad over them, in the preview and the recording. This section adds to the stack, policy and tools above.
+
+- **Detect.** Three more YOLOE classes: `billboard`, `poster`, `advertisement`. That makes 7 in total, all in the NCNN export. Their default rule is show.
+- **Replace.** For each ad box whose rule is `replace`, find the sign's four corners inside the box and warp the chosen image onto them. If no clean corners are found, fill the box. Corners are smoothed per track, and the 0.5 s hold-over applies.
+- **Order.** Ads are drawn before pixelation, so a face in front of a sign stays censored. A person standing in front of a sign gets painted over by the ad; that is a known limit.
+- **Your ads.** Image files in `assets/ads/`. The agent's prompt lists the file names.
+- **Control.** "Replace the billboards with the coffee ad", "swap to the sneaker ad", "stop replacing ads". On the Mac, key A cycles through off and each image.
+- **Fallback.** If YOLOE-26n can't find the demo poster at 1–3 m, match a reference photo of that poster with ORB features and a homography instead.
+- **Schedule.** WP12: one implementer, 60 minutes, alongside integration and the Pi port. If the Pi port slips, ads stay Mac-only for the demo. The leak review is not cut.
+
+## Clips
+
+Added at 14:40. "Clip that" saves the last 30 seconds as its own file, whether or not you are recording. This section adds to the stack and tools above.
+
+- **Buffer.** `clipper.py` keeps the last 60 s of censored frames in memory as JPEGs, a few tens of megabytes at 640×480.
+- **Save.** On command, a writer thread copies the last N seconds (default 30, maximum 60) to `~/privacy-cam-recordings/clips/` as MJPG, without stalling the preview.
+- **Privacy.** The buffer is fed from the same censored output as the recorder, never from the camera, so blurs and replaced ads are baked into every clip.
+- **Control.** Voice: "clip that", "save the last 20 seconds" (tool `save_clip`). A Clip button on the touchscreen; key C on the Mac. The agent replies "Clip saved."
+- **Not today.** Auto-marking of good moments and vertical export.
+- **Schedule.** WP13: one implementer, 40 minutes. It doesn't depend on detection, so it is the lower-risk of the two late additions. If time gets tight, protect in this order: integration, Pi port, leak review, clips, ad replacement.
 
 ## Never leaks
 
