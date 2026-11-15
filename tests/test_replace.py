@@ -572,12 +572,11 @@ def test_the_ad_carries_grain_that_changes_from_frame_to_frame(tmp_path: Path, s
 def test_the_ad_keeps_its_aspect_ratio_on_a_tall_panel(tmp_path: Path) -> None:
     asset = np.full((90, 160, 3), AD_COLOR, np.uint8)
     asset[25:65, 60:100] = (255, 0, 0)  # a square mark in the middle
-    image = _wall_with_old_poster()
-    out = _draw_asset(tmp_path, asset, image)
-    band = out[195:285]  # where the asset itself lands, at its own scale, in the middle of the 160 x 280 panel
-    ys, xs = np.nonzero(np.all(np.abs(band.astype(int) - (255, 0, 0)) <= 60, axis=-1))
+    out = _draw_asset(tmp_path, asset, _wall_with_old_poster())
+    mark = np.all(np.abs(out.astype(int) - (255, 0, 0)) <= 60, axis=-1)
+    ys, xs = np.nonzero(mark)
     assert abs((xs.max() - xs.min()) - (ys.max() - ys.min())) <= 3  # still square, not stretched to the panel
-    assert np.any(out[105:190, 205:355] != image[105:190, 205:355], axis=-1).all()  # the rest is filled, mirrored
+    assert _is_ad(out[110:130, 220:340]).all() and _is_ad(out[350:370, 220:340]).all()  # the edge colour fills the rest
 
 
 def test_the_edge_of_the_ad_fades_into_the_scene(tmp_path: Path) -> None:
@@ -605,3 +604,11 @@ def test_a_sign_with_a_found_outline_keeps_its_shape_when_it_restarts_without_on
     fitted = replace._fitted(corners, (300, 100, 400, 200))
     assert replace._bounds(fitted) == pytest.approx((300, 100, 400, 200))
     assert fitted[1][1] > fitted[0][1] and fitted[3][0] < fitted[0][0]  # still skewed the same way, not a rectangle
+
+
+def test_a_photo_is_cropped_to_the_panel_not_streaked_or_stretched() -> None:
+    photo = np.random.default_rng(3).integers(0, 255, (90, 160, 3), dtype=np.uint8)
+    tall = np.float32([[0, 0], [100, 0], [100, 200], [0, 200]])
+    rect = replace._letterbox(photo, tall)
+    assert rect[:, 0].min() >= 0 and rect[:, 0].max() <= 160 and rect[:, 1].min() == 0 and rect[:, 1].max() == 90
+    assert (rect[1, 0] - rect[0, 0]) / (rect[3, 1] - rect[0, 1]) == pytest.approx(0.5)

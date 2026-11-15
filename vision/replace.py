@@ -84,6 +84,7 @@ _MAX_BLACK = 40.0  # a dark old poster must not crush the ad: the black point is
 _MIN_WHITE, _MAX_WHITE = 170.0, 235.0  # nor dim it or blow it out: the white point stays in this range
 _TONE_GAIN = 0.1  # share of the way to this frame's range per frame, so the ad's exposure does not flicker
 _TONE_CELLS = 32  # the range is measured on the region shrunk to this many cells per side
+_SMOOTH_EDGE_STEP = 4.0  # levels between neighbouring border pixels; under it the asset's edge is flat or a soft gradient
 _SOFTEN_SIGMA = 0.9  # px of Gaussian blur on the warped ad: the clip is softer than any asset
 _FEATHER_SIGMA = 1.0  # px; the quad's edge fades into the scene
 _GRAIN_SIGMA = 2.0  # levels of luminance noise added to the ad; one fixed pattern, shifted every frame
@@ -491,7 +492,7 @@ def _composite(
 ) -> None:
     """Draws `asset` on the sign as if it had been filmed there, writing only inside the box `xyxy`.
 
-    The asset keeps its aspect ratio (mirrored into the rest of the panel), takes the old
+    The asset keeps its aspect ratio (a logo's plain edge colour fills the rest of the panel; a photo is cropped to it), takes the old
     poster's black and white point, is softened and grained like the footage, is darkened where the
     scene shows something dark in front, and fades into the scene at the quad's edge.
     """
@@ -500,7 +501,7 @@ def _composite(
     local = sign.corners - np.float32([x1, y1])
     homography = cv2.getPerspectiveTransform(_letterbox(asset, local), local)
     warped = cv2.warpPerspective(
-        asset, homography, (x2 - x1, y2 - y1), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT
+        asset, homography, (x2 - x1, y2 - y1), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE
     )
     mask = np.zeros(scene.shape[:2], dtype=np.uint8)
     cv2.fillConvexPoly(mask, np.round(local).astype(np.int32), 255)
@@ -518,13 +519,17 @@ def _composite(
 
 
 def _letterbox(asset: np.ndarray, quad: np.ndarray) -> np.ndarray:
-    """The rectangle in asset pixels that maps onto `quad`: the whole asset, centred, grown along one
-    axis to the quad's aspect ratio, so the asset is never stretched (the warp mirrors the asset into the rest: repeating its edge pixels streaked a photo)."""
+    """The rectangle in asset pixels that maps onto `quad`, centred and with the quad's aspect ratio, so
+    the asset is never stretched. A smooth-edged asset (a logo on a flat or graded ground) is shown whole and the warp
+    repeats its edge colour into the rest; any other (a photo) is cropped, as repeating its edge streaks."""
     asset_h, asset_w = asset.shape[:2]
     quad_w = (np.linalg.norm(quad[1] - quad[0]) + np.linalg.norm(quad[2] - quad[3])) / 2
     quad_h = (np.linalg.norm(quad[3] - quad[0]) + np.linalg.norm(quad[2] - quad[1])) / 2
     aspect = max(quad_w, 1.0) / max(quad_h, 1.0)
-    width, height = max(asset_w, asset_h * aspect), max(asset_h, asset_w / aspect)
+    borders = (asset[0], asset[-1], asset[:, 0], asset[:, -1])
+    whole = max(np.abs(np.diff(border.astype(np.int16), axis=0)).mean() for border in borders) < _SMOOTH_EDGE_STEP
+    fit = max if whole else min
+    width, height = fit(asset_w, asset_h * aspect), fit(asset_h, asset_w / aspect)
     left, top = (asset_w - width) / 2, (asset_h - height) / 2
     return np.float32([[left, top], [left + width, top], [left + width, top + height], [left, top + height]])
 
