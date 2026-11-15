@@ -247,6 +247,11 @@ def test_offline_wake_then_panic_turns_panic_on_without_the_network(agent: Voice
 # --- confirmation ---
 
 
+@pytest.fixture
+def needs_yes(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(config, "WAKE_REVEAL_NEEDS_YES", True)
+
+
 def _call(agent: VoiceAgent, name: str, arguments: dict, call_id: str = "fc_1") -> dict:
     agent._dispatch({"type": "FunctionCallRequest", "functions": [
         {"id": call_id, "name": name, "arguments": json.dumps(arguments), "client_side": True}]})
@@ -257,6 +262,7 @@ def _user_says(agent: VoiceAgent, text: str) -> None:
     agent._dispatch({"type": "ConversationText", "role": "user", "content": text})
 
 
+@pytest.mark.usefixtures("needs_yes")
 def test_show_all_after_a_wake_waits_for_a_yes(agent: VoiceAgent) -> None:
     _wake(agent)
     result = _call(agent, "show_all", {})
@@ -267,6 +273,7 @@ def test_show_all_after_a_wake_waits_for_a_yes(agent: VoiceAgent) -> None:
     assert agent.policy.snapshot().class_rules[FACE] == "show"
 
 
+@pytest.mark.usefixtures("needs_yes")
 def test_the_model_reissuing_the_call_after_yes_runs_it(agent: VoiceAgent) -> None:
     _wake(agent)
     _call(agent, "set_class_rule", {"label": FACE, "action": "show"})
@@ -275,6 +282,7 @@ def test_the_model_reissuing_the_call_after_yes_runs_it(agent: VoiceAgent) -> No
     assert _call(agent, "set_class_rule", {"label": FACE, "action": "show"}, "fc_2")["ok"]
 
 
+@pytest.mark.usefixtures("needs_yes")
 def test_anything_but_yes_drops_the_held_reveal(agent: VoiceAgent) -> None:
     _wake(agent)
     _call(agent, "show_all", {})
@@ -283,6 +291,7 @@ def test_anything_but_yes_drops_the_held_reveal(agent: VoiceAgent) -> None:
     assert agent.policy.snapshot().class_rules[FACE] == "blur"
 
 
+@pytest.mark.usefixtures("needs_yes")
 def test_a_talk_turn_reveals_directly(agent: VoiceAgent) -> None:
     _wake(agent)
     agent.set_talking(True)
@@ -291,6 +300,7 @@ def test_a_talk_turn_reveals_directly(agent: VoiceAgent) -> None:
     assert _call(agent, "show_all", {})["ok"]
 
 
+@pytest.mark.usefixtures("needs_yes")
 @pytest.mark.parametrize("name, arguments", [
     ("blur_all", {}),
     ("set_class_rule", {"label": FACE, "action": "blur"}),
@@ -302,6 +312,7 @@ def test_blur_panic_and_others_never_wait(agent: VoiceAgent, name: str, argument
     assert _call(agent, name, arguments)["ok"]
 
 
+@pytest.mark.usefixtures("needs_yes")
 def test_confirmations_pure() -> None:
     confirmations = Confirmations(window_s=15.0)
     assert not confirmations.needs_confirmation("show_all", {}, began_with_wake=False)
@@ -315,6 +326,28 @@ def test_confirmations_pure() -> None:
     assert not confirmations.needs_confirmation("show_all", {}, began_with_wake=True)
     assert confirmations.confirm("something else", now=22.0) is None
     assert confirmations.needs_confirmation("show_all", {}, began_with_wake=True)
+
+
+@pytest.mark.parametrize("name, arguments", [
+    ("show_all", {}),
+    ("set_class_rule", {"label": FACE, "action": "show"}),
+])
+def test_with_the_switch_off_a_wake_reveal_runs_at_once(
+    agent: VoiceAgent, monkeypatch: pytest.MonkeyPatch, name: str, arguments: dict
+) -> None:
+    monkeypatch.setattr(config, "WAKE_REVEAL_NEEDS_YES", False)
+    _wake(agent)
+    result = _call(agent, name, arguments)
+    assert result["ok"] and "needs_confirmation" not in result
+    assert agent.policy.snapshot().class_rules[FACE] == "show"
+    assert agent._confirmations.pending is None
+
+
+def test_with_the_switch_off_nothing_needs_confirmation(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(config, "WAKE_REVEAL_NEEDS_YES", False)
+    confirmations = Confirmations()
+    assert not confirmations.needs_confirmation("show_all", {}, began_with_wake=True)
+    assert not confirmations.needs_confirmation("set_class_rule", {"label": FACE, "action": "show"}, True)
 
 
 # --- the real detector on generated speech ---

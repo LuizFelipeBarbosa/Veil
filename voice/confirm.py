@@ -2,6 +2,7 @@
 
 A false wake must not reveal anything: after a wake, show_all and "show every face" are held
 until the next user turn is a spoken yes. Talk-button turns never need it.
+config.WAKE_REVEAL_NEEDS_YES turns the whole check off: then nothing is ever held.
 """
 
 from __future__ import annotations
@@ -9,6 +10,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
+import config
 from contracts import FACE
 
 CONFIRM_WINDOW_S = 15.0
@@ -37,6 +39,8 @@ class Confirmations:
         self._approved: Call | None = None  # the call the user just said yes to
 
     def needs_confirmation(self, name: str, args: Any, began_with_wake: bool) -> bool:
+        if not config.WAKE_REVEAL_NEEDS_YES:  # read per call so tests can switch it
+            return False
         if not began_with_wake or not _reveals(name, args):
             return False
         return (name, args) != self._approved  # the model re-issuing it after a yes runs
