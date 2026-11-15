@@ -337,6 +337,18 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "request to unblur or show everything.",
         "parameters": _NO_ARGUMENTS,
     },
+    {
+        "name": "start_recording",
+        "description": "Start recording the censored video to a file. Same as the Record button. "
+        "Safe to call when already recording. Changes nothing about what is blurred.",
+        "parameters": _NO_ARGUMENTS,
+    },
+    {
+        "name": "stop_recording",
+        "description": "Stop recording and save the file. Same as the Record button. Safe to call "
+        "when not recording.",
+        "parameters": _NO_ARGUMENTS,
+    },
 ]
 
 TOOL_NAMES = tuple(schema["name"] for schema in TOOL_SCHEMAS)

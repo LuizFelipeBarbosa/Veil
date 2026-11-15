@@ -141,6 +141,7 @@ def test_scene_dict_matches_the_brief() -> None:
 def test_the_tools() -> None:
     assert contracts.TOOL_NAMES == (
         "get_scene", "set_class_rule", "set_track", "set_replacement", "blur_all", "clear_panic", "show_all",
+        "start_recording", "stop_recording",
     )
     by_name = {schema["name"]: schema for schema in contracts.TOOL_SCHEMAS}
     assert by_name["set_replacement"]["parameters"]["properties"]["label"]["enum"] == list(AD_CLASSES)
