@@ -31,7 +31,7 @@ Built at VexoHacks. Team: TODO(lead). Demo video: TODO(lead).
 | Remembered people | Someone you unblurred stays unblurred when their track is lost and comes back (up to 16 people, this session only). "Blur all faces" forgets them all. |
 | Objects | License plates, street-name signs, house numbers and storefront signs are pixelated (YOLOE-26n with text prompts). Stop, one-way and other traffic signs are deliberately left alone. |
 | Tap to toggle | Outlines on the preview show what you can tap: blue "blurred", orange "shown", purple "ad". A tap flips blur and show for that one track. Outlines are drawn on the screen only, never into the recording. |
-| Voice | Hold **Talk** (key **T**). Deepgram Voice Agent with 7 client-side tools (below). The reply is spoken and shown as a 3-line transcript. |
+| Voice | Hold **Talk** (key **T**). Deepgram Voice Agent with 9 client-side tools (below). The reply is spoken and shown as a 3-line transcript. |
 | Panic | **Panic** (key **P**) pixelates the whole frame at the press, with no hold. Clearing it needs a fresh press held for 1 s (or "clear panic"). |
 | Recording | **Record** (key **R**) writes only censored frames, as MJPG `.avi` at 640x480, 15 FPS, video only (no audio track), to `~/privacy-cam-recordings/privacy-cam-YYYYMMDD-HHMMSS.avi`. |
 | Live ad replacement | **Ads** button (key **A**) or voice. Billboards, posters and advertisements are shown by default; switched on, each one is covered with an image from `assets/ads/` (each press goes to the next image, then off). When several ads are in view, the chosen image goes on the first and the others get the next images in the folder, so no two show the same one. The sign's corners are found and the image is warped onto them, then followed from frame to frame with optical flow. Ads are drawn before censoring, so a face in front of an ad is still pixelated on top. |
@@ -39,7 +39,8 @@ Built at VexoHacks. Team: TODO(lead). Demo video: TODO(lead).
 ### Voice tools and example phrases
 
 The agent can call exactly these tools (`contracts.TOOL_SCHEMAS`): `get_scene`, `set_class_rule`,
-`set_track`, `set_replacement`, `blur_all`, `clear_panic`, `show_all`. Phrases from the prompt and
+`set_track`, `set_replacement`, `blur_all`, `clear_panic`, `show_all`, `start_recording`,
+`stop_recording`. Phrases from the prompt and
 the live check (`scripts/voice_check.py`):
 
 - "Blur all faces." / "Unblur everyone."
@@ -49,10 +50,11 @@ the live check (`scripts/voice_check.py`):
 - "Unblur the guy." with two people in view: it asks "Which one, left or right?" and acts on the answer.
 - "Unblur everything." / "Blur everything." / "Clear panic." / "Reset."
 - "Replace the ads." / "Stop replacing the ads."
+- "Start recording." / "Stop recording.": the same recorder as the Record button, censored frames only.
 - "Hide the tattoos.": not a known type, so it says what it can hide instead.
 
 If the model has made no tool call 2 s after you let go of Talk, a local keyword parser handles
-class-wide, panic, show-everything and ad commands. Anything about one specific person is left to
+class-wide, panic, show-everything, ad and recording commands. Anything about one specific person is left to
 the model.
 
 ## How it stays private

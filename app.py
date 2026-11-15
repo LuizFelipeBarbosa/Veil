@@ -60,7 +60,7 @@ def main() -> None:
 
     ad_assets = list_assets()
     voice = VoiceAgent(
-        ToolHandlers(policy, pipeline.scene, ad_assets=ad_assets), on_transcript, use_audio=not args.no_audio
+        ToolHandlers(policy, pipeline.scene, ad_assets=ad_assets, recorder=recorder), on_transcript, use_audio=not args.no_audio
     )
 
     def cycle_ad() -> None:
