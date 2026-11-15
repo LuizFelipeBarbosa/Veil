@@ -6,6 +6,7 @@ import asyncio
 import json
 import sys
 import time
+from pathlib import Path
 
 import pytest
 
@@ -521,6 +522,143 @@ def test_keyword_fallback_says_there_are_no_ad_images(monkeypatch: pytest.Monkey
     agent._loop.close()
 
 
+# --- recording (WP28) ---
+
+
+class _FakeRecorder:
+    """Stands in for recorder.Recorder: no video is written."""
+
+    def __init__(self, fail_start: bool = False) -> None:
+        self.is_recording = False
+        self._fail_start = fail_start
+
+    def start(self) -> Path:
+        if self._fail_start:
+            raise RuntimeError("cannot open video writer")
+        self.is_recording = True
+        return Path("/recordings/privacy-cam-1.avi")
+
+    def stop(self) -> Path | None:
+        was_recording, self.is_recording = self.is_recording, False
+        return Path("/recordings/privacy-cam-1.avi") if was_recording else None
+
+
+def _recording_handlers(recorder: object) -> tuple[ToolHandlers, Policy]:
+    policy = Policy()
+    return ToolHandlers(policy, lambda: scenes.EMPTY, recorder=recorder), policy  # type: ignore[arg-type]
+
+
+def test_start_recording_twice_is_safe() -> None:
+    recorder = _FakeRecorder()
+    handlers, policy = _recording_handlers(recorder)
+    before = policy.snapshot()
+    assert handlers.handle("start_recording", {}) == {"ok": True, "recording": True, "already": False}
+    assert handlers.handle("start_recording", {}) == {"ok": True, "recording": True, "already": True}
+    assert recorder.is_recording and policy.snapshot() == before
+
+
+def test_stop_recording_twice_is_safe_and_names_the_file_only() -> None:
+    recorder = _FakeRecorder()
+    handlers, policy = _recording_handlers(recorder)
+    handlers.handle("start_recording", {})
+    first = handlers.handle("stop_recording", {})
+    second = handlers.handle("stop_recording", {})
+    assert first == {"ok": True, "recording": False, "already": False, "file": "privacy-cam-1.avi"}
+    assert second == {"ok": True, "recording": False, "already": True, "file": None}
+    assert not recorder.is_recording
+
+
+def test_stop_recording_when_never_started() -> None:
+    handlers, _ = _recording_handlers(_FakeRecorder())
+    assert handlers.handle("stop_recording", {}) == {"ok": True, "recording": False, "already": True, "file": None}
+
+
+def test_a_failed_start_is_a_refusal_and_changes_no_policy() -> None:
+    handlers, policy = _recording_handlers(_FakeRecorder(fail_start=True))
+    policy.set_panic(True)
+    before = policy.snapshot()
+    result = handlers.handle("start_recording", {})
+    assert result["ok"] is False and result["recording"] is False and "error" in result
+    assert policy.snapshot() == before
+
+
+def test_recording_tools_without_a_recorder_refuse() -> None:
+    handlers, policy = _handlers()
+    before = policy.snapshot()
+    for name in ("start_recording", "stop_recording"):
+        result = handlers.handle(name, {})
+        assert result["ok"] is False and "error" in result
+    assert policy.snapshot() == before
+
+
+@pytest.mark.parametrize(
+    "transcript, expected",
+    [
+        ("Start recording.", "start_recording"),
+        ("record", "start_recording"),
+        ("Record this.", "start_recording"),
+        ("can you start recording now", "start_recording"),
+        ("Stop recording.", "stop_recording"),
+        ("stop the recording please", "stop_recording"),
+        ("That's enough, stop recording.", "stop_recording"),
+        ("end the recording", "stop_recording"),
+    ],
+)
+def test_keyword_parser_recording(transcript: str, expected: str) -> None:
+    assert parse_keywords(transcript) == [(expected, {})]
+
+
+@pytest.mark.parametrize(
+    "transcript, expected",
+    [
+        ("stop", []),
+        ("stop it", []),
+        ("don't record", []),
+        ("don't stop recording", []),
+        ("is it recording", []),
+        ("stop panic", [("clear_panic", {})]),
+        ("stop the panic", [("clear_panic", {})]),
+        ("panic, start recording", [("blur_all", {})]),
+        ("stop recording and blur everything", [("blur_all", {})]),
+        ("record and hide the plates", [("set_class_rule", {"label": "license plate", "action": "blur"})]),
+        ("stop replacing ads", _show_all_ads()),
+        ("record her face", []),  # names a person and a show-free face: left to the model
+    ],
+)
+def test_keyword_recording_does_not_collide(transcript: str, expected: list) -> None:
+    assert parse_keywords(transcript) == expected
+
+
+@pytest.mark.parametrize(
+    "transcript, reply, recording",
+    [("record this", "Recording.", True), ("stop recording", "Recording stopped.", False)],
+)
+def test_keyword_fallback_recording_replies(
+    monkeypatch: pytest.MonkeyPatch, transcript: str, reply: str, recording: bool
+) -> None:
+    monkeypatch.delenv(config.DEEPGRAM_API_KEY_ENV, raising=False)
+    recorder = _FakeRecorder()
+    recorder.is_recording = not recording
+    handlers, _ = _recording_handlers(recorder)
+    lines: list[tuple[str, str]] = []
+    agent = _offline_agent(handlers, lines)
+    agent._turn = _Turn(ended_at=0.0, user_text=transcript)
+    agent._run_keyword_fallback()
+    assert lines[-1] == ("agent", reply) and recorder.is_recording is recording
+    agent._loop.close()
+
+
+def test_keyword_fallback_says_when_recording_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(config.DEEPGRAM_API_KEY_ENV, raising=False)
+    handlers, _ = _recording_handlers(_FakeRecorder(fail_start=True))
+    lines: list[tuple[str, str]] = []
+    agent = _offline_agent(handlers, lines)
+    agent._turn = _Turn(ended_at=0.0, user_text="start recording")
+    agent._run_keyword_fallback()
+    assert lines[-1] == ("agent", "Couldn't do that.")
+    agent._loop.close()
+
+
 # --- settings (offline) ---
 
 
@@ -536,6 +674,7 @@ def test_settings_shape() -> None:
     assert think["provider"]["type"] == "open_ai" and think["provider"]["temperature"] == 0
     assert [f["name"] for f in think["functions"]] == list(TOOL_NAMES) == [
         "get_scene", "set_class_rule", "set_track", "set_replacement", "blur_all", "clear_panic", "show_all",
+        "start_recording", "stop_recording",
     ]
     assert all("endpoint" not in f for f in think["functions"])
     assert "get_scene" in think["prompt"]
@@ -544,6 +683,7 @@ def test_settings_shape() -> None:
         assert label in think["prompt"]
     assert "show_all" in think["prompt"]
     assert "no ad images on this device" in think["prompt"]
+    assert "start_recording" in think["prompt"] and "stop_recording" in think["prompt"]
     assert f"under {config.AGENT_REPLY_MAX_WORDS} words" in think["prompt"]
 
 

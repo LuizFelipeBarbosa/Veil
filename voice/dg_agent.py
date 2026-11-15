@@ -23,7 +23,7 @@ from typing import Any, Callable, Sequence
 
 import config
 from contracts import AD_CLASSES, KNOWN_CLASSES, TOOL_SCHEMAS
-from voice.tools import NO_AD_IMAGES, ToolHandlers, parse_keywords
+from voice.tools import KEYWORD_REPLIES, NO_AD_IMAGES, ToolHandlers, parse_keywords
 
 # role is "you" or "agent"
 OnTranscript = Callable[[str, str], None]
@@ -91,6 +91,11 @@ D. A type that is NOT a known type (logos, tattoos, cars, screens): call no tool
    "I can hide faces, plates, street signs, house numbers, storefronts."
 """
 
+_RECORDING_PROMPT = """
+F. Recording, never ask first: "start recording", "record this" -> start_recording; "stop recording",
+   "stop" meaning the recording -> stop_recording. Reply says whether it is recording now.
+"""
+
 _REPLY_PROMPT = f"""
 If a tool returns ok false, say briefly that it didn't work.
 Reply in plain words, under {config.AGENT_REPLY_MAX_WORDS} words, no ids, no lists, no markdown.
@@ -125,7 +130,7 @@ def build_settings(
     reasoning_mode: str | None = None,
     ad_assets: Sequence[str] = (),
 ) -> dict[str, Any]:
-    """The Voice Agent Settings message: Flux, hosted think model, Aura-2, the 7 tools, the prompt.
+    """The Voice Agent Settings message: Flux, hosted think model, Aura-2, the 9 tools, the prompt.
 
     The keyword arguments let scripts/voice_check.py try other hosted models;
     temperature=None leaves it out, for models that only accept their default;
@@ -158,7 +163,7 @@ def build_settings(
             },
             "think": {
                 "provider": think_provider_settings,
-                "prompt": _COMMANDS_PROMPT + _ads_prompt(ad_assets) + _REPLY_PROMPT,
+                "prompt": _COMMANDS_PROMPT + _ads_prompt(ad_assets) + _RECORDING_PROMPT + _REPLY_PROMPT,
                 "functions": [dict(schema) for schema in TOOL_SCHEMAS],
             },
             "speak": {"provider": {"type": "deepgram", "model": speak_model or config.DG_SPEAK_MODEL}},
@@ -484,7 +489,7 @@ class VoiceAgent(threading.Thread):
             if not result.get("ok"):
                 errors.append(result.get("error"))
         if not errors:
-            self._say("agent", "Done.")
+            self._say("agent", KEYWORD_REPLIES.get(calls[-1][0], "Done."))
         else:
             self._say("agent", NO_AD_IMAGES if NO_AD_IMAGES in errors else "Couldn't do that.")
 
