@@ -9,7 +9,7 @@ into a tool call that runs on the device. It can also replace billboards and pos
 own ad images, live. Everything was developed and tested on a MacBook first; one setting switches
 it to the Pi.
 
-Built at VexoHacks. Team: TODO(lead). Demo video: TODO(lead).
+Built at VexoHacks by team Veil. Demo video: coming soon.
 
 ## Principles
 
