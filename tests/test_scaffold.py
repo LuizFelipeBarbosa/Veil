@@ -290,3 +290,22 @@ def test_a_sign_box_inside_a_replaced_ad_does_not_pixelate_it_but_faces_and_chos
 
     policy.set_track_override("obj#2", "blur")  # the operator's own choice wins
     assert flat(pipeline._censor(frame).image, 200, 200)
+
+
+def test_a_weak_ad_box_is_not_replaced_until_its_track_is_confirmed(tmp_path: Path) -> None:
+    cv2.imwrite(str(tmp_path / "ad.png"), np.zeros((90, 160, 3), dtype=np.uint8))
+    policy = Policy()
+    policy.set_replacement("poster", "ad.png")
+    pipeline = Pipeline(FileSource(SYNTHETIC_CLIP), policy)
+    pipeline._ads = AdReplacer(tmp_path)
+    pipeline._watchdog.beat_faces(time.monotonic())
+    pipeline._watchdog.beat_objects(time.monotonic())
+    raw = np.random.default_rng(1).integers(1, 255, (config.FRAME_HEIGHT, config.FRAME_WIDTH, 3), dtype=np.uint8)
+
+    def censored_with(conf: float) -> np.ndarray:
+        box = TrackedBox("obj#1", "poster", (96, 96, 416, 336), conf, frame_index=0, last_seen=0.0)
+        return pipeline._censor(BufferedFrame(index=0, timestamp=0.0, image=raw, boxes=[box], faces_done=True)).image
+
+    assert (censored_with(config.AD_CONFIRM_CONF - 0.1) == raw).all()  # weak and never confirmed: left alone
+    assert not (censored_with(config.AD_CONFIRM_CONF) == raw).all()  # confirmed: replaced
+    assert not (censored_with(config.AD_CONFIRM_CONF - 0.1) == raw).all()  # and stays replaced when it weakens

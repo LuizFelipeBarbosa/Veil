@@ -83,6 +83,9 @@ OBJECT_MIN_PERIOD_S = 0.5 if _ON_PI else 0.0
 # --- ad replacement ---
 ADS_DIR = Path(__file__).parent / "assets" / "ads"  # landscape images; the file name is the asset name
 AD_IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg")
+# An ad track is replaced only once it has scored this at least once. On ad.mp4 the false ad boxes
+# (a wall, the speaker's head) never passed 0.28; real panels reach 0.4 within a few frames.
+AD_CONFIRM_CONF = 0.4
 KEY_CYCLE_AD = "a"  # off -> first asset -> next asset -> ... -> off
 
 # --- scene ---

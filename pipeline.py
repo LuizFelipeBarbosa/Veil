@@ -104,6 +104,7 @@ class Pipeline(threading.Thread):
         # much longer than a face, or it would unblur between two detections.
         self._object_hold_over = render.HoldOver(config.HOLD_OVER_S + config.OBJECT_MIN_PERIOD_S)
         self._ads = AdReplacer()
+        self._confirmed_ad_ids: set[str] = set()
         self._last_object_result_index = -1
         self._seen_track_ids: set[str] = set()
         self._confirmed_face_ids: set[str] = set()
@@ -317,8 +318,10 @@ class Pipeline(threading.Thread):
         the ad wins: a sign box lying almost wholly inside a replaced ad is dropped, so the ad is not
         pixelated. Faces are never dropped, and neither is a sign the operator chose to blur.
         """
-        replaced = [box for box in frame.boxes if self._decide(box, policy) == REPLACE]
-        if not replaced or not frame.faces_done:
+        if not frame.faces_done:
+            return frame
+        replaced = [box for box in frame.boxes if self._is_replaceable_ad(box, policy)]
+        if not replaced:
             return frame
         kept = [
             box for box in frame.boxes
@@ -330,6 +333,17 @@ class Pipeline(threading.Thread):
         ]
         image = self._ads.draw(frame.image, replaced, policy.replacements, now)
         return dataclasses.replace(frame, image=image, boxes=kept)
+
+    def _is_replaceable_ad(self, box: TrackedBox, policy: PolicySnapshot) -> bool:
+        """Decided "replace", and its track has been confirmed as an ad (config.AD_CONFIRM_CONF).
+
+        A box that fails this is left as the camera saw it (ads are shown by default).
+        """
+        if self._decide(box, policy) != REPLACE:
+            return False
+        if box.conf >= config.AD_CONFIRM_CONF:
+            self._confirmed_ad_ids.add(box.id)
+        return box.id in self._confirmed_ad_ids
 
     def _decide_censoring(self, box: TrackedBox, policy: PolicySnapshot) -> Action:
         """What censor() needs to know: a replaced ad is already drawn over, so it is not pixelated."""
