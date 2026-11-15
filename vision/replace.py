@@ -73,6 +73,9 @@ _SHADE_DARK = 0.2
 _SHADE_OFFSET = 16.0  # added to both luminances, so near-black scenes are not read as dark structure
 _PRINT_KERNEL = np.ones((7, 7), np.uint8)  # dark details narrower than this are the old poster's print
 _SURFACE_CELLS = 6  # the surface brightness is the region averaged on this grid, then smoothed back up
+# A sign that re-locks (a quad found at last, a lost flow, a quad lost again, another box of the same
+# panel) does not jump there: its corners cover this share of the remaining way per frame.
+_GLIDE_GAIN = 0.3
 _MAX_ASSET_SIDE = 640  # px; assets are shrunk to this on load, which bounds the cache and the warp
 # Compositing (WP31): the ad is made to look filmed with the scene instead of pasted on it.
 # Tone: the asset's 0..255 is squeezed into the old poster's own range, its 5th to 95th percentile of
@@ -118,6 +121,7 @@ class _Sign:
         self.seen = box.last_seen  # last_seen of the newest box supporting it (the detector's clock)
         self.updated = now  # when that box first reached draw() (draw's clock): the hold-over counts from here
         self.support = 0  # frames with a supporting box: the established sign wins an overlap
+        self.glide = np.zeros((4, 2), np.float32)  # what is left of the way to where it re-locked (see _correct)
         self.tone: np.ndarray | None = None  # black and white point its ad is drawn with (see _tone)
 
 
@@ -193,6 +197,9 @@ class AdReplacer:
             sign.support += 1
             supported.append(sign)
 
+        for sign in self._signs:
+            step = _GLIDE_GAIN * sign.glide
+            sign.corners, sign.glide = sign.corners + step, sign.glide - step
         grain = self._shifted_grain(height, width)
         drawn: list[_Sign] = []
         for sign in sorted(supported, key=lambda s: s.support, reverse=True):
@@ -326,9 +333,16 @@ def _correct(sign: _Sign, image: np.ndarray, xyxy: tuple[int, int, int, int], re
     # a single one may be texture that happens to fit the box.
     confirmed = found is not None and sign.candidate is not None and not _is_other_outline(found, sign.candidate, xyxy)
     on_screen = _clipped(_bounds(sign.corners), image.shape[1], image.shape[0])  # the box is clipped too
-    if restart or _iou(on_screen, xyxy) < _MIN_AGREE_IOU or (confirmed and not sign.outlined):
-        sign.corners = found if found is not None else _box_corners(xyxy)
-        sign.outlined, sign.candidate = found is not None, None
+    elsewhere = _iou(on_screen, xyxy) < _MIN_AGREE_IOU
+    if restart or elsewhere or (confirmed and not sign.outlined):
+        if found is not None:
+            target = found
+        elif sign.outlined:  # no quad this time: keep the sign's shape, fitted to the box, not a plain rectangle
+            target = _fitted(sign.corners + sign.glide, xyxy)
+        else:
+            target = _box_corners(xyxy)
+        sign.outlined, sign.candidate = sign.outlined or found is not None, None
+        sign.glide = target - sign.corners
         return
     if not sign.outlined:
         sign.candidate = found
@@ -341,6 +355,13 @@ def _correct(sign: _Sign, image: np.ndarray, xyxy: tuple[int, int, int, int], re
     box_size = np.float32([xyxy[2] - xyxy[0], xyxy[3] - xyxy[1]])
     scale = 1 + _BOX_GAIN * (box_size / np.maximum(size, 1) - 1)
     sign.corners = centre + _BOX_GAIN * (box_centre - centre) + (sign.corners - centre) * scale
+
+
+def _fitted(corners: np.ndarray, xyxy: tuple[int, int, int, int]) -> np.ndarray:
+    """`corners` moved and scaled so that their bounds are the box: the same shape at the box's place."""
+    x1, y1, x2, y2 = _bounds(corners)
+    scale = np.float32([(xyxy[2] - xyxy[0]) / max(x2 - x1, 1.0), (xyxy[3] - xyxy[1]) / max(y2 - y1, 1.0)])
+    return ((corners - np.float32([x1, y1])) * scale + np.float32(xyxy[:2])).astype(np.float32)
 
 
 def _is_other_outline(found: np.ndarray, corners: np.ndarray, xyxy: tuple[int, int, int, int]) -> bool:
@@ -470,7 +491,7 @@ def _composite(
 ) -> None:
     """Draws `asset` on the sign as if it had been filmed there, writing only inside the box `xyxy`.
 
-    The asset keeps its aspect ratio (its edge colours fill the rest of the panel), takes the old
+    The asset keeps its aspect ratio (mirrored into the rest of the panel), takes the old
     poster's black and white point, is softened and grained like the footage, is darkened where the
     scene shows something dark in front, and fades into the scene at the quad's edge.
     """
@@ -479,7 +500,7 @@ def _composite(
     local = sign.corners - np.float32([x1, y1])
     homography = cv2.getPerspectiveTransform(_letterbox(asset, local), local)
     warped = cv2.warpPerspective(
-        asset, homography, (x2 - x1, y2 - y1), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE
+        asset, homography, (x2 - x1, y2 - y1), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT
     )
     mask = np.zeros(scene.shape[:2], dtype=np.uint8)
     cv2.fillConvexPoly(mask, np.round(local).astype(np.int32), 255)
@@ -498,7 +519,7 @@ def _composite(
 
 def _letterbox(asset: np.ndarray, quad: np.ndarray) -> np.ndarray:
     """The rectangle in asset pixels that maps onto `quad`: the whole asset, centred, grown along one
-    axis to the quad's aspect ratio, so the asset is never stretched (the warp repeats its edge colours)."""
+    axis to the quad's aspect ratio, so the asset is never stretched (the warp mirrors the asset into the rest: repeating its edge pixels streaked a photo)."""
     asset_h, asset_w = asset.shape[:2]
     quad_w = (np.linalg.norm(quad[1] - quad[0]) + np.linalg.norm(quad[2] - quad[3])) / 2
     quad_h = (np.linalg.norm(quad[3] - quad[0]) + np.linalg.norm(quad[2] - quad[1])) / 2

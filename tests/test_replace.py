@@ -245,13 +245,17 @@ def test_a_scene_cut_starts_fresh_and_drops_held_over_boxes(ads_dir: Path) -> No
     assert not _is_ad(out[350:470, 470:630]).any()  # nor later
 
 
-def test_a_box_that_jumps_restarts_at_its_new_place(ads_dir: Path) -> None:
+def test_a_box_that_jumps_takes_the_sign_to_its_new_place_in_a_glide_not_a_jump(ads_dir: Path) -> None:
     image = np.zeros((HEIGHT, WIDTH, 3), np.uint8)  # no edges: the box itself is the measurement
     replacer = AdReplacer(ads_dir)
     for step in range(5):
         replacer.draw(image, [_box((100, 50, 300, 200), last_seen=step * 0.07)], ASSETS, now=step * 0.07)
-    out = replacer.draw(image, [_box((170, 50, 370, 200), last_seen=0.35)], ASSETS, now=0.35)
-    assert _is_ad(out[50:200, 170:370]).mean() > 0.99  # no sliding in from the old place
+    first = replacer.draw(image, [_box((170, 50, 370, 200), last_seen=0.35)], ASSETS, now=0.35)
+    assert 0.2 < _is_ad(first[50:200, 300:370]).mean() < 0.5  # WP31: a third of the way, no 70 px jump
+    for step in range(6, 18):  # there within a dozen frames, not pulled at the slow box gain
+        out = replacer.draw(image, [_box((170, 50, 370, 200), last_seen=step * 0.07)], ASSETS, now=step * 0.07)
+    assert _is_ad(out[50:200, 174:370]).mean() > 0.99
+    assert not _is_ad(out[50:200, 100:168]).any()
 
 
 def test_a_sign_whose_outline_moves_far_restarts_within_a_few_frames(ads_dir: Path) -> None:
@@ -394,8 +398,9 @@ def test_lost_flow_restarts_the_sign_at_its_fresh_box(ads_dir: Path, drawn_quads
     changed = frame.copy()
     changed[30:240, 80:340] = cv2.warpAffine(_texture(seed=2), _camera(0), (WIDTH, HEIGHT))[30:240, 80:340]
     drawn_quads.append([])
-    replacer.draw(changed, [_box((120, 50, 320, 200), last_seen=0.07)], ASSETS, now=0.07)
-    assert np.abs(drawn_quads[-1][0] - [[120, 50], [320, 50], [320, 200], [120, 200]]).max() < 1  # not pulled slowly
+    for step in range(1, 14):  # WP31: it glides to the box over a few frames instead of jumping
+        replacer.draw(changed, [_box((120, 50, 320, 200), last_seen=step * 0.07)], ASSETS, now=step * 0.07)
+    assert np.abs(drawn_quads[-1][-1] - [[120, 50], [320, 50], [320, 200], [120, 200]]).max() < 1  # not pulled slowly
 
 
 def test_a_sign_without_a_fresh_box_for_the_hold_over_is_dropped(ads_dir: Path) -> None:
@@ -592,3 +597,10 @@ def test_small_dark_print_on_the_old_poster_leaves_no_holes_in_the_ad(tmp_path: 
         cv2.line(image, (220, y), (340, y), (20, 20, 20), 2)  # lines of text
     out = _draw_asset(tmp_path, np.full((90, 160, 3), AD_COLOR, np.uint8), image)
     assert _is_ad(out[120:360, 215:345]).all()
+
+
+def test_a_sign_with_a_found_outline_keeps_its_shape_when_it_restarts_without_one() -> None:
+    corners = np.float32([[220, 130], [430, 160], [420, 330], [210, 300]])
+    fitted = replace._fitted(corners, (300, 100, 400, 200))
+    assert replace._bounds(fitted) == pytest.approx((300, 100, 400, 200))
+    assert fitted[1][1] > fitted[0][1] and fitted[3][0] < fitted[0][0]  # still skewed the same way, not a rectangle
