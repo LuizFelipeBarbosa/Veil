@@ -34,7 +34,7 @@ Built at VexoHacks. Team: TODO(lead). Demo video: TODO(lead).
 | Voice | Hold **Talk** (key **T**). Deepgram Voice Agent with 7 client-side tools (below). The reply is spoken and shown as a 3-line transcript. |
 | Panic | **Panic** (key **P**) pixelates the whole frame at the press, with no hold. Clearing it needs a fresh press held for 1 s (or "clear panic"). |
 | Recording | **Record** (key **R**) writes only censored frames, as MJPG `.avi` at 640x480, 15 FPS, video only (no audio track), to `~/privacy-cam-recordings/privacy-cam-YYYYMMDD-HHMMSS.avi`. |
-| Live ad replacement | **Ads** button (key **A**) or voice. Billboards, posters and advertisements are shown by default; switched on, each one is covered with an image from `assets/ads/` (each press goes to the next image, then off). The sign's corners are found and the image is warped onto them, then followed from frame to frame with optical flow. Ads are drawn before censoring, so a face in front of an ad is still pixelated on top. |
+| Live ad replacement | **Ads** button (key **A**) or voice. Billboards, posters and advertisements are shown by default; switched on, each one is covered with an image from `assets/ads/` (each press goes to the next image, then off). When several ads are in view, the chosen image goes on the first and the others get the next images in the folder, so no two show the same one. The sign's corners are found and the image is warped onto them, then followed from frame to frame with optical flow. Ads are drawn before censoring, so a face in front of an ad is still pixelated on top. |
 
 ### Voice tools and example phrases
 
