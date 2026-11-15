@@ -237,7 +237,14 @@ _LABEL_GROUPS: dict[str, tuple[str, ...]] = {
     **{phrase: AD_CLASSES for phrase in ("ads", "adverts", "advertising")},
 }
 _REPLACE_WORDS = {"replace", "swap"}
-_STOP_REPLACING_PHRASES = ("stop replacing", "stop swapping", "ads off", "adverts off")
+_STOP_REPLACING_PHRASES = (
+    "stop replacing", "stop swapping", "ads off", "adverts off",
+    "turn off the ads", "turn off ads", "disable the ads", "disable ads",
+)
+# The on-screen Ads button means replacement, so "ads on" replaces them (never blurs or shows).
+_START_REPLACING_PHRASES = (
+    "ads on", "adverts on", "turn on the ads", "turn on ads", "enable the ads", "enable ads",
+)
 # show_all only when the whole command, minus these fillers, is one of the phrases below,
 # so "unblur all faces" (the face class) or "show all the signs" never becomes show_all.
 _SHOW_ALL_PHRASES = {
@@ -278,7 +285,7 @@ def parse_keywords(transcript: str, ad_assets: Sequence[str] = ()) -> list[tuple
     if _contains_phrase(text, _PANIC_PHRASES):
         return [("blur_all", {})]
     groups = _label_groups_in(text)
-    if words & _REPLACE_WORDS or _contains_phrase(text, _STOP_REPLACING_PHRASES):
+    if words & _REPLACE_WORDS or _contains_phrase(text, _STOP_REPLACING_PHRASES + _START_REPLACING_PHRASES):
         return _ad_calls(text, words, groups, tuple(ad_assets))
     if words & _SHOW_WORDS and words & (_NEGATION_WORDS | _POSSESSIVE_WORDS):
         return []  # a misheard "don't", or "show my face", must never unblur everyone

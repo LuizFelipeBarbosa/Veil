@@ -129,7 +129,13 @@ E. Replacing ads with an image. Ads are not private; this is not blurring. Only 
    image fits X -> call no tool and say which images there are.
    "Stop replacing the ads", "show the real ads" -> set_class_rule(label, "show") for every ad
    type, or only the type named.
-   Blurring or showing ads is path A: "blur the posters" -> set_class_rule(label="poster", action="blur").
+   The Ads button means replacement. "Ads on", "turn on / enable / start the ads", "ad mode"
+   -> replacement ON: set_replacement(label, "{ad_assets[0]}") for billboard, poster and
+   advertisement. "Ads off", "turn off / disable the ads" -> replacement OFF:
+   set_class_rule(label, "show") for those three. Never blur for these phrases.
+   "Toggle the ads" -> call get_scene; if any ad type's rule is "replace", turn replacement
+   off, otherwise on. Reply "Ads replaced." or "Ads back to normal."
+   Only an explicit "blur/hide the ads" blurs them (path A): "blur the posters" -> set_class_rule(label="poster", action="blur").
 """
 
 
