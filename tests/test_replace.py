@@ -32,6 +32,18 @@ def ads_dir(tmp_path: Path) -> Path:
     return tmp_path
 
 
+# The look (WP31) changes every ad pixel: tone, grain. The geometry tests below tell the ad by its exact
+# colour, so they run with the look neutral; the look has its own tests at the end, which restore it.
+SCENE_LOOK = {name: getattr(replace, name) for name in ("_MAX_BLACK", "_MIN_WHITE", "_MAX_WHITE", "_GRAIN_SIGMA")}
+NEUTRAL_LOOK = {"_MAX_BLACK": 0.0, "_MIN_WHITE": 255.0, "_MAX_WHITE": 255.0, "_GRAIN_SIGMA": 0.0}
+
+
+@pytest.fixture(autouse=True)
+def neutral_look(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name, value in NEUTRAL_LOOK.items():
+        monkeypatch.setattr(replace, name, value)
+
+
 def _wall() -> np.ndarray:
     """A grey wall with a little texture, so edges come only from the sign."""
     rng = np.random.default_rng(0)
@@ -286,14 +298,14 @@ def test_a_flat_sign_under_uneven_light_shows_the_ad_colours(ads_dir: Path) -> N
 def drawn_quads(monkeypatch: pytest.MonkeyPatch) -> list[list[np.ndarray]]:
     """The corners of every quad drawn, per draw() call (a new list is started by the test)."""
     calls: list[list[np.ndarray]] = []
-    warp = replace._warp_into_box
+    composite = replace._composite
 
-    def spy(out, image, asset, corners, region):
+    def spy(out, image, asset, sign, region, grain):
         if calls:
-            calls[-1].append(np.array(corners, float))
-        return warp(out, image, asset, corners, region)
+            calls[-1].append(np.array(sign.corners, float))
+        return composite(out, image, asset, sign, region, grain)
 
-    monkeypatch.setattr(replace, "_warp_into_box", spy)
+    monkeypatch.setattr(replace, "_composite", spy)
     return calls
 
 
@@ -498,3 +510,85 @@ def test_the_directory_is_rescanned_only_for_a_name_not_in_it(colour_dir: Path, 
     for step in range(5, 10):
         _draw_signs(replacer, SIGN_BOXES[:2], "e.png", step)
     assert len(scans) == 2  # once for the new name, not every frame
+
+
+# --- the look (WP31): the ad is toned, grained and feathered into the scene ---
+
+
+LOOK_BOX = (200, 100, 360, 380)  # a tall panel, no outline: the whole box is filled
+
+
+@pytest.fixture
+def scene_look(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name, value in SCENE_LOOK.items():
+        monkeypatch.setattr(replace, name, value)
+
+
+def _wall_with_old_poster(paper: int = 200) -> np.ndarray:
+    image = _wall()
+    x1, y1, x2, y2 = LOOK_BOX
+    image[y1:y2, x1:x2] = paper
+    return image
+
+
+def _draw_asset(directory: Path, asset: np.ndarray, image: np.ndarray, calls: int = 1) -> np.ndarray:
+    cv2.imwrite(str(directory / "ad.png"), asset)
+    replacer = AdReplacer(directory)
+    for _ in range(calls):
+        out = replacer.draw(image, [_box(LOOK_BOX)], ASSETS, now=0.0)
+    return out
+
+
+def test_a_white_ad_is_as_white_as_the_old_poster_not_whiter(tmp_path: Path, scene_look: None) -> None:
+    image = _wall_with_old_poster(paper=200)
+    out = _draw_asset(tmp_path, np.full((90, 160, 3), 255, np.uint8), image)
+    inside = out[120:360, 220:340].astype(float)
+    assert abs(inside.mean() - 200) < 3  # the paper's white, not 255
+    assert (out[:100] == image[:100]).all() and (out[:, :200] == image[:, :200]).all()  # only inside the box
+
+
+def test_a_black_ad_on_a_dark_poster_is_neither_crushed_nor_dimmed(tmp_path: Path, scene_look: None) -> None:
+    asset = np.zeros((90, 160, 3), np.uint8)
+    asset[:, 80:] = 255
+    out = _draw_asset(tmp_path, asset, _wall_with_old_poster(paper=90))
+    assert out[240, 240].mean() < 100  # the black half: at the dark poster's level at most
+    assert out[240, 320].mean() >= replace._MIN_WHITE - 10  # the white half is not dimmed to the poster's 90
+
+
+def test_the_ad_carries_grain_that_changes_from_frame_to_frame(tmp_path: Path, scene_look: None) -> None:
+    image = _wall_with_old_poster()
+    asset = np.full((90, 160, 3), 128, np.uint8)
+    first = _draw_asset(tmp_path, asset, image)[120:360, 220:340].astype(float)
+    second = _draw_asset(tmp_path, asset, image, calls=2)[120:360, 220:340].astype(float)
+    assert 1.0 < first.std() < 2 * replace._GRAIN_SIGMA
+    assert (first != second).mean() > 0.3
+
+
+def test_the_ad_keeps_its_aspect_ratio_on_a_tall_panel(tmp_path: Path) -> None:
+    asset = np.full((90, 160, 3), AD_COLOR, np.uint8)
+    asset[25:65, 60:100] = (255, 0, 0)  # a square mark in the middle
+    out = _draw_asset(tmp_path, asset, _wall_with_old_poster())
+    mark = np.all(np.abs(out.astype(int) - (255, 0, 0)) <= 60, axis=-1)
+    ys, xs = np.nonzero(mark)
+    assert abs((xs.max() - xs.min()) - (ys.max() - ys.min())) <= 3  # still square, not stretched to the panel
+    assert _is_ad(out[110:130, 220:340]).all() and _is_ad(out[350:370, 220:340]).all()  # the edge colour fills the rest
+
+
+def test_the_edge_of_the_ad_fades_into_the_scene(tmp_path: Path) -> None:
+    image = _wall_with_skewed_sign()
+    cv2.imwrite(str(tmp_path / "ad.png"), np.full((150, 200, 3), AD_COLOR, np.uint8))
+    out = AdReplacer(tmp_path).draw(image, [_box(SKEWED_SIGN_BOX)], ASSETS, now=0.0)
+    changed = np.any(out != image, axis=-1)
+    partly = changed & ~_is_ad(out)
+    assert partly.any()  # pixels between the scene and the ad
+    edge = np.zeros((HEIGHT, WIDTH), np.uint8)
+    cv2.polylines(edge, [SKEWED_SIGN], True, 255, 13)
+    assert not (partly & (edge == 0)).any()  # and only along the outline
+
+
+def test_small_dark_print_on_the_old_poster_leaves_no_holes_in_the_ad(tmp_path: Path) -> None:
+    image = _wall_with_old_poster()
+    for y in range(150, 330, 20):
+        cv2.line(image, (220, y), (340, y), (20, 20, 20), 2)  # lines of text
+    out = _draw_asset(tmp_path, np.full((90, 160, 3), AD_COLOR, np.uint8), image)
+    assert _is_ad(out[120:360, 215:345]).all()

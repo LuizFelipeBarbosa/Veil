@@ -71,8 +71,20 @@ _CUT_SHARE = 0.3
 _SHADE_FULL = 0.6
 _SHADE_DARK = 0.2
 _SHADE_OFFSET = 16.0  # added to both luminances, so near-black scenes are not read as dark structure
+_PRINT_KERNEL = np.ones((7, 7), np.uint8)  # dark details narrower than this are the old poster's print
 _SURFACE_CELLS = 6  # the surface brightness is the region averaged on this grid, then smoothed back up
 _MAX_ASSET_SIDE = 640  # px; assets are shrunk to this on load, which bounds the cache and the warp
+# Compositing (WP31): the ad is made to look filmed with the scene instead of pasted on it.
+# Tone: the asset's 0..255 is squeezed into the old poster's own range, its 5th to 95th percentile of
+# luminance, so a white ad is as white as the panel was and black is the scene's lifted black.
+_MAX_BLACK = 40.0  # a dark old poster must not crush the ad: the black point is at most this
+_MIN_WHITE, _MAX_WHITE = 170.0, 235.0  # nor dim it or blow it out: the white point stays in this range
+_TONE_GAIN = 0.1  # share of the way to this frame's range per frame, so the ad's exposure does not flicker
+_TONE_CELLS = 32  # the range is measured on the region shrunk to this many cells per side
+_SOFTEN_SIGMA = 0.9  # px of Gaussian blur on the warped ad: the clip is softer than any asset
+_FEATHER_SIGMA = 1.0  # px; the quad's edge fades into the scene
+_GRAIN_SIGMA = 2.0  # levels of luminance noise added to the ad; one fixed pattern, shifted every frame
+_GRAIN_SHIFT = 64  # px the pattern can shift by
 
 
 def list_assets(directory: Path = config.ADS_DIR) -> tuple[str, ...]:
@@ -106,6 +118,7 @@ class _Sign:
         self.seen = box.last_seen  # last_seen of the newest box supporting it (the detector's clock)
         self.updated = now  # when that box first reached draw() (draw's clock): the hold-over counts from here
         self.support = 0  # frames with a supporting box: the established sign wins an overlap
+        self.tone: np.ndarray | None = None  # black and white point its ad is drawn with (see _tone)
 
 
 class AdReplacer:
@@ -131,6 +144,8 @@ class AdReplacer:
         self._newest_seen = float("-inf")  # newest last_seen of any box so far
         # Boxes last seen at or before this belong to the scene before a cut, or to a sign dropped after the hold-over.
         self._stale_until = float("-inf")
+        self._grain: np.ndarray | None = None  # fixed noise, frame size plus _GRAIN_SHIFT; synthetic, not image content
+        self._draws = 0  # shifts the grain
 
     def draw(
         self, image: np.ndarray, boxes: Sequence[TrackedBox], assets: Mapping[str, str], now: float
@@ -178,6 +193,7 @@ class AdReplacer:
             sign.support += 1
             supported.append(sign)
 
+        grain = self._shifted_grain(height, width)
         drawn: list[_Sign] = []
         for sign in sorted(supported, key=lambda s: s.support, reverse=True):
             clashing = [other for other in drawn if _quad_overlap(sign.corners, other.corners) > 0]
@@ -190,8 +206,17 @@ class AdReplacer:
             region = _clipped(_rounded(sign.region), width, height)
             asset = self._asset(sign.asset_name)
             if asset is not None and region[2] - region[0] >= 2 and region[3] - region[1] >= 2:
-                _warp_into_box(out, image, asset, sign.corners, region)
+                _composite(out, image, asset, sign, region, grain)
         return out
+
+    def _shifted_grain(self, height: int, width: int) -> np.ndarray:
+        """Frame-sized noise for this call: the one fixed pattern, cut at an offset that changes every call."""
+        if self._grain is None or self._grain.shape != (height + _GRAIN_SHIFT, width + _GRAIN_SHIFT):
+            noise = np.random.default_rng(0).normal(0.0, _GRAIN_SIGMA, (height + _GRAIN_SHIFT, width + _GRAIN_SHIFT))
+            self._grain = noise.astype(np.float32)
+        self._draws += 1
+        dx, dy = (37 * self._draws) % _GRAIN_SHIFT, (53 * self._draws) % _GRAIN_SHIFT
+        return self._grain[dy:dy + height, dx:dx + width]
 
     def _choose(self, assets: Mapping[str, str]) -> None:
         """The operator's mapping changed: every living sign picks again, the most established first,
@@ -439,27 +464,71 @@ def _ordered(points: np.ndarray) -> np.ndarray:
     return np.roll(clockwise, -int(np.argmin(clockwise.sum(axis=1))), axis=0)
 
 
-def _warp_into_box(
-    out: np.ndarray, image: np.ndarray, asset: np.ndarray, corners: np.ndarray, xyxy: tuple[int, int, int, int]
+def _composite(
+    out: np.ndarray, image: np.ndarray, asset: np.ndarray, sign: _Sign, xyxy: tuple[int, int, int, int],
+    grain: np.ndarray,
 ) -> None:
-    """Warp `asset` onto `corners`, shaded by `image`, writing only inside the box. Works on the box region alone."""
+    """Draws `asset` on the sign as if it had been filmed there, writing only inside the box `xyxy`.
+
+    The asset keeps its aspect ratio (its edge colours fill the rest of the panel), takes the old
+    poster's black and white point, is softened and grained like the footage, is darkened where the
+    scene shows something dark in front, and fades into the scene at the quad's edge.
+    """
     x1, y1, x2, y2 = xyxy
-    asset_h, asset_w = asset.shape[:2]
-    source = np.float32([[0, 0], [asset_w, 0], [asset_w, asset_h], [0, asset_h]])
-    local = corners - np.float32([x1, y1])
-    homography = cv2.getPerspectiveTransform(source, local)
-    region = out[y1:y2, x1:x2]
-    warped = cv2.warpPerspective(asset, homography, (x2 - x1, y2 - y1), flags=cv2.INTER_LINEAR)
-    mask = np.zeros(region.shape[:2], dtype=np.uint8)
+    scene = image[y1:y2, x1:x2]
+    local = sign.corners - np.float32([x1, y1])
+    homography = cv2.getPerspectiveTransform(_letterbox(asset, local), local)
+    warped = cv2.warpPerspective(
+        asset, homography, (x2 - x1, y2 - y1), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE
+    )
+    mask = np.zeros(scene.shape[:2], dtype=np.uint8)
     cv2.fillConvexPoly(mask, np.round(local).astype(np.int32), 255)
-    shading = cv2.cvtColor(_shading(image[y1:y2, x1:x2]), cv2.COLOR_GRAY2BGR)
-    shaded = cv2.multiply(warped, shading, dtype=cv2.CV_8U)
-    np.copyto(region, shaded, where=mask[..., None] > 0)
+
+    sign.tone = _tone(scene, mask, sign.tone)
+    black, white = sign.tone
+    ad = cv2.GaussianBlur(warped, (0, 0), _SOFTEN_SIGMA).astype(np.float32)
+    ad = ad * ((white - black) / 255.0) + black
+    ad += grain[y1:y2, x1:x2, None]
+    ad *= _shading(scene)[..., None]
+
+    # Half the fade falls a pixel or two outside the quad, still inside the box: shrinking the ad instead
+    # left a rim of the old poster around it.
+    alpha = (cv2.GaussianBlur(mask, (0, 0), _FEATHER_SIGMA).astype(np.float32) / 255.0)[..., None]
+    blended = scene * (1.0 - alpha) + ad * alpha
+    out[y1:y2, x1:x2] = np.clip(blended + 0.5, 0, 255).astype(np.uint8)
+
+
+def _letterbox(asset: np.ndarray, quad: np.ndarray) -> np.ndarray:
+    """The rectangle in asset pixels that maps onto `quad`: the whole asset, centred, grown along one
+    axis to the quad's aspect ratio, so the asset is never stretched (the warp repeats its edge colours)."""
+    asset_h, asset_w = asset.shape[:2]
+    quad_w = (np.linalg.norm(quad[1] - quad[0]) + np.linalg.norm(quad[2] - quad[3])) / 2
+    quad_h = (np.linalg.norm(quad[3] - quad[0]) + np.linalg.norm(quad[2] - quad[1])) / 2
+    aspect = max(quad_w, 1.0) / max(quad_h, 1.0)
+    width, height = max(asset_w, asset_h * aspect), max(asset_h, asset_w / aspect)
+    left, top = (asset_w - width) / 2, (asset_h - height) / 2
+    return np.float32([[left, top], [left + width, top], [left + width, top + height], [left, top + height]])
+
+
+def _tone(scene: np.ndarray, mask: np.ndarray, previous: np.ndarray | None) -> np.ndarray:
+    """Black and white point (luminance levels) for the ad on this sign: the old poster's own range inside
+    the quad, kept within sane limits and eased from `previous` so it does not flicker."""
+    cells = (_TONE_CELLS, _TONE_CELLS)
+    luminance = cv2.resize(cv2.cvtColor(scene, cv2.COLOR_BGR2GRAY), cells, interpolation=cv2.INTER_AREA)
+    on_sign = luminance[cv2.resize(mask, cells, interpolation=cv2.INTER_NEAREST) > 0]
+    if on_sign.size == 0:  # a sliver of a quad: keep what it had, or the middle of the limits
+        return previous if previous is not None else np.float32([_MAX_BLACK / 2, (_MIN_WHITE + _MAX_WHITE) / 2])
+    black, white = np.percentile(on_sign, (5, 95))
+    measured = np.float32([min(black, _MAX_BLACK), np.clip(white, _MIN_WHITE, _MAX_WHITE)])
+    return measured if previous is None else previous + _TONE_GAIN * (measured - previous)
 
 
 def _shading(region: np.ndarray) -> np.ndarray:
     """Per pixel 0..1: 1 on the sign's surface, less where something clearly darker is (a post, a frame)."""
-    luminance = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    # Closed first: the old poster's own small dark print (text, thin lines) is not something in front
+    # of the sign and must not eat holes into the ad; a post or a frame is wider and survives.
+    luminance = cv2.morphologyEx(cv2.cvtColor(region, cv2.COLOR_BGR2GRAY), cv2.MORPH_CLOSE, _PRINT_KERNEL)
+    luminance = luminance.astype(np.float32)
     height, width = luminance.shape
     cells = cv2.resize(luminance, (_SURFACE_CELLS, _SURFACE_CELLS), interpolation=cv2.INTER_AREA)
     surface = cv2.resize(cells, (width, height), interpolation=cv2.INTER_LINEAR)
