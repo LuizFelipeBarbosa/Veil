@@ -257,7 +257,8 @@ def test_a_face_in_front_of_a_replaced_ad_is_still_pixelated(tmp_path: Path) -> 
 
     assert not censored.fail_closed
     ad_block = censored.image[104:120, 104:120]  # on the poster, away from the face
-    assert (ad_block[..., :2] == 0).all() and ad_block[..., 2].max() > ad_block[..., 2].min()  # the ad, unpixelated
+    # the ad is toned and grained to match the scene, so compare its colour, not exact pixels
+    assert ad_block[..., 2].mean() > ad_block[..., :2].mean() + 40 and ad_block[..., 2].std() > 5  # the red ad, unpixelated
     face_block = censored.image[176:192, 224:240]
     assert (face_block == face_block[0, 0]).all()  # one flat block: pixelated on top of the ad
     assert (censored.image[:90] == raw[:90]).all()  # outside both boxes nothing changed
