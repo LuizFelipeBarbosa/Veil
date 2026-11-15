@@ -1,4 +1,4 @@
-"""WP7/WP14/WP21 live check: typed commands through Deepgram's Voice Agent against fixture scenes.
+"""WP7/WP14/WP21/WP28 live check: typed commands through Deepgram's Voice Agent against fixture scenes.
 
     set -a; source .env; set +a; python scripts/voice_check.py [--model gpt-4.1-mini ...]
 
@@ -27,7 +27,10 @@ from voice.dg_agent import VoiceAgent  # noqa: E402
 from voice.tools import ToolHandlers  # noqa: E402
 
 GET_SCENE = ("get_scene", {})
-STATE_TOOLS = {"set_class_rule", "set_track", "set_replacement", "blur_all", "clear_panic", "show_all"}
+STATE_TOOLS = {
+    "set_class_rule", "set_track", "set_replacement", "blur_all", "clear_panic", "show_all",
+    "start_recording", "stop_recording",
+}
 CAN_HIDE_WORDS = ("face", "plate", "street", "house", "storefront")
 # Every case runs with these on the "device", so the old commands are checked with the ad prompt too.
 FAKE_AD_ASSETS = ("summer_sale.png", "coffee.jpg", "concert_tickets.png")
@@ -44,6 +47,7 @@ class Case:
     reply_lacks: tuple[str, ...] = ()  # the reply must contain none of these
     follow_up: str = ""  # a second user turn in the same session, sent once the first reply settles
     then_scene: str = ""  # the scene after the first get_scene call (a track got a new id)
+    recording: bool = False  # the fake recorder is already recording when the command arrives
 
 
 def _rule(label: str, action: str) -> tuple[str, dict[str, Any]]:
@@ -218,6 +222,13 @@ CASES = [
     Case("ads_replaced", "Stop replacing the ads.", (), any_order=_SHOW_ADS),
     Case("ads_replaced", "Show the real ads.", (), any_order=_SHOW_ADS),
     Case("ads_in_view", "Blur the posters.", (_rule("poster", "blur"),)),
+    # --- WP28: recording by voice ---
+    Case("owner_and_friend_left", "Start recording.", (("start_recording", {}),)),
+    Case("owner_and_friend_left", "Record this.", (("start_recording", {}),)),
+    Case("signs_and_plate", "Can you start recording now?", (("start_recording", {}),)),
+    Case("owner_and_friend_left", "Stop recording.", (("stop_recording", {}),), recording=True),
+    Case("signs_and_plate", "Stop the recording please.", (("stop_recording", {}),), recording=True),
+    Case("two_candidates", "That's enough, stop recording.", (("stop_recording", {}),), recording=True),
 ]
 
 
@@ -237,11 +248,27 @@ class _Run:
         return (time.monotonic() - self.sent_at) * 1000
 
 
+class _FakeRecorder:
+    """Stands in for recorder.Recorder: no video is written."""
+
+    def __init__(self, recording: bool) -> None:
+        self.is_recording = recording
+
+    def start(self) -> Path:
+        self.is_recording = True
+        return Path("privacy-cam-check.avi")
+
+    def stop(self) -> Path | None:
+        was_recording, self.is_recording = self.is_recording, False
+        return Path("privacy-cam-check.avi") if was_recording else None
+
+
 class _RecordingHandlers(ToolHandlers):
     """Records every call; switches to `then_scene` once the agent has read the first scene."""
 
-    def __init__(self, policy: Policy, scene: Scene, then_scene: Scene | None, run: _Run) -> None:
-        super().__init__(policy, lambda: self._scene, ad_assets=FAKE_AD_ASSETS)
+    def __init__(self, policy: Policy, scene: Scene, then_scene: Scene | None, run: _Run, recording: bool) -> None:
+        recorder = _FakeRecorder(recording)
+        super().__init__(policy, lambda: self._scene, ad_assets=FAKE_AD_ASSETS, recorder=recorder)  # type: ignore[arg-type]
         self._scene = scene
         self._then_scene = then_scene
         self._run = run
@@ -272,7 +299,7 @@ def run_case(case: Case, overrides: dict[str, Any], timeout_s: float = 15.0) -> 
 
     then_scene = SCENES[case.then_scene] if case.then_scene else None
     agent = VoiceAgent(
-        _RecordingHandlers(policy, SCENES[case.scene], then_scene, run),
+        _RecordingHandlers(policy, SCENES[case.scene], then_scene, run, case.recording),
         on_transcript,
         use_audio=False,
         keyword_fallback_s=None,

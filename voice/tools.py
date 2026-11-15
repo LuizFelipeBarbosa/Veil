@@ -6,25 +6,41 @@ import json
 import logging
 import os
 import re
-from typing import Any, Callable, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Sequence
 
 import config
 from contracts import ACTIONS, AD_CLASSES, FACE, KNOWN_CLASSES, Policy, Scene
+
+if TYPE_CHECKING:
+    from recorder import Recorder
 
 _log = logging.getLogger(__name__)
 
 # The refusal when there is nothing to replace ads with; the keyword fallback says it out loud.
 NO_AD_IMAGES = "There are no ad images on the device."
+# What the keyword fallback says after these tools succeed; every other tool gets "Done.".
+KEYWORD_REPLIES = {"start_recording": "Recording.", "stop_recording": "Recording stopped."}
 
 
 class ToolHandlers:
-    """Runs the 7 client-side tools against the local Policy and the live Scene."""
+    """Runs the 9 client-side tools against the local Policy, the live Scene and the Recorder."""
 
-    def __init__(self, policy: Policy, get_scene: Callable[[], Scene], ad_assets: Sequence[str] = ()) -> None:
-        """ad_assets: the image file names in config.ADS_DIR, the only things an ad can be replaced with."""
+    def __init__(
+        self,
+        policy: Policy,
+        get_scene: Callable[[], Scene],
+        ad_assets: Sequence[str] = (),
+        *,
+        recorder: Recorder | None = None,
+    ) -> None:
+        """ad_assets: the image file names in config.ADS_DIR, the only things an ad can be replaced with.
+
+        recorder: the app's Recorder (thread-safe); without one the recording tools refuse.
+        """
         self._policy = policy
         self._get_scene = get_scene
         self._ad_assets = tuple(ad_assets)
+        self._recorder = recorder
 
     @property
     def ad_assets(self) -> tuple[str, ...]:
@@ -54,6 +70,8 @@ class ToolHandlers:
                 return {"ok": True, "panic": False}
             if name == "show_all":
                 return self._show_all()
+            if name in ("start_recording", "stop_recording"):
+                return self._recording_tool(name)
             return _refuse(f"unknown tool {name!r}")
         except ValueError as error:  # contracts.Policy's hard limits, bad arguments
             return _refuse(str(error))
@@ -105,6 +123,30 @@ class ToolHandlers:
             "note": "everything stays unblurred, including people who arrive later; "
             "things blurred one by one stay blurred and replaced ads stay replaced",
         }
+
+    def _recording_tool(self, name: str) -> dict[str, Any]:
+        """Start or stop the Recorder; both are safe to repeat. Never touches the Policy."""
+        recorder = self._recorder
+        if recorder is None:
+            return _refuse("there is no recorder on this device")
+        try:
+            if name == "start_recording":
+                already = recorder.is_recording
+                recorder.start()
+                return {"ok": True, "recording": True, "already": already}
+            path = recorder.stop()
+            return {"ok": True, "recording": False, "already": path is None, "file": path.name if path else None}
+        except Exception as error:  # e.g. the video writer cannot open: report it, change nothing else
+            _log.exception("tool %r failed", name)
+            return {**_refuse(f"{name} failed: {type(error).__name__}"), **_recording_state(recorder)}
+
+
+def _recording_state(recorder: Recorder) -> dict[str, Any]:
+    """{"recording": bool} when the recorder can still say, else {}."""
+    try:
+        return {"recording": bool(recorder.is_recording)}
+    except Exception:  # noqa: BLE001
+        return {}
 
 
 def _find_asset(requested: str, ad_assets: tuple[str, ...]) -> str | None:
@@ -207,12 +249,15 @@ _FILLER_WORDS = {"please", "now", "just", "ok", "okay", "hey", "can", "could", "
 _NEGATION_WORDS = {"don't", "dont", "not", "never", "no", "stop"}
 # "show my face" is about one person; "blur my face" may still blur the whole class (fails closed).
 _POSSESSIVE_WORDS = {"my", "his", "your", "their"}
+# Recording. "stop" alone is not here: it may mean stop panic or stop replacing ads.
+_STOP_RECORDING_PHRASES = ("stop recording", "stop the recording", "end recording", "end the recording")
+_START_RECORDING_PHRASES = ("start recording", "start the recording", "start a recording", "begin recording", "record")
 
 
 def parse_keywords(transcript: str, ad_assets: Sequence[str] = ()) -> list[tuple[str, dict[str, Any]]]:
     """Map a transcript to tool calls (name, arguments) without the model; [] if nothing matches.
 
-    Only class-wide, show-everything, panic and ad-replacement commands; anything about a specific
+    Only recording, class-wide, show-everything, panic and ad-replacement commands; anything about a specific
     person returns [], and so does a negated show ("don't show the plates") or "show my face".
     "Replace the ads" uses the ad image the command names, else the first of ad_assets.
     """
@@ -220,7 +265,12 @@ def parse_keywords(transcript: str, ad_assets: Sequence[str] = ()) -> list[tuple
         return []
     text = " ".join(re.sub(r"[^a-z0-9#' ]+", " ", transcript.lower()).split())
     words = set(text.split())
-    if not words or words & _PERSON_WORDS or "#" in text:
+    if not words:
+        return []
+    recording = _recording_call(text, words)
+    if recording:
+        return [recording]
+    if words & _PERSON_WORDS or "#" in text:
         return []
 
     if _contains_phrase(text, _CLEAR_PANIC_PHRASES):
@@ -240,6 +290,24 @@ def parse_keywords(transcript: str, ad_assets: Sequence[str] = ()) -> list[tuple
         return []  # nothing, or more than one thing, to act on
     action = "show" if wants_show else "blur"
     return [("set_class_rule", {"label": label, "action": action}) for label in groups.pop()]
+
+
+def _recording_call(text: str, words: set[str]) -> tuple[str, dict[str, Any]] | None:
+    """start_recording or stop_recording for a command that is only about recording, else None.
+
+    Checked before the person words, so "record this" works. A command that also blurs, shows,
+    replaces or names a type ("stop recording and blur everything") is left to the rest of the
+    parser and the model, so panic and blur commands keep priority; a negation matches nothing.
+    """
+    if words & (_BLUR_WORDS | _SHOW_WORDS | _REPLACE_WORDS | {"panic", "don't", "dont", "not", "never", "no"}):
+        return None
+    if _label_groups_in(text):
+        return None
+    if _contains_phrase(text, _STOP_RECORDING_PHRASES):
+        return ("stop_recording", {})
+    if _contains_phrase(text, _START_RECORDING_PHRASES):
+        return ("start_recording", {})
+    return None
 
 
 def _ad_calls(
