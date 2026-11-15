@@ -26,6 +26,8 @@ Milestones: 13:00 faces blurred (Mac) | 14:00 owner + signs/plates | 14:45 voice
 | 23 | Ads: stale ad after a scene cut, sliding, glass/occluders | merged 15:36; cut fixed, glass only partly (needs masks) | 15:23–15:31 | wp23-ad-cuts-occlusion | lead: re-watch; panel blurred as a sign after the cut |
 | 25 | Ads: never stacked, placed by optical flow instead of the detector box; weak ad tracks not replaced until confirmed | merged 16:02, filter 16:08 | 15:47–16:00 | wp25-ad-flow | ad still drawn over a person in front of it (needs masks) |
 | 26 | Ghost faces on the bus-stop advert: rotated passes firing on printed ads | merged 16:03 (lead accepted the recall trade) | 15:47–16:00 | wp26-ghost-faces | a face turned past 90° beside a sure upright face can be missed |
+| 28 | Voice tools start_recording / stop_recording | running, due 16:40 | 16:24– | wp28-recording-tools | — |
+| 29 | Wake phrase "hey veil" on-device (vosk), one-turn mic, spoken yes for reveal commands | running, due 16:50 | 16:27– | wp29-wake-phrase | lead: live test with a real voice; Pi untested |
 | 8 | Integration (orchestrator) | all threads wired 12:03; live voice test pending | 12:03– | main | lead: hold T and speak |
 | 9 | Pi port (orchestrator + lead) | queued | 14:45–15:30 | main | needs WP8, the Pi |
 | 10 | Leak review (read-only) | done 15:36: no pixel leak; analytics, backfill, mic tail, debug-log fixes merged | 15:23–15:36 | — | residual: swap exposure ~0.9 s, sign labelled as ad is shown |
@@ -35,3 +37,4 @@ Milestones: 13:00 faces blurred (Mac) | 14:00 owner + signs/plates | 14:45 voice
 
 Code frozen 16:08 (lead: stop at ad occlusion). After this: bug fixes and config.py only.
 Public repo `Veil` created and main pushed 16:16 (author address rewritten to the GitHub no-reply one). Later commits are not pushed until the lead says.
+Code reopened by the lead for hands-free work; hard stop for code 17:00. No push until the lead says.
