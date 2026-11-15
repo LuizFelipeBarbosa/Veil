@@ -129,6 +129,9 @@ WAKE_PHRASE = "hey veil"
 VOSK_MODEL = WEIGHTS_DIR / "vosk-model-small-en-us-0.15"
 WAKE_STABLE_BLOCKS = 4  # the phrase must stay in the recognizer's guess this many 50 ms blocks in a row
 WAKE_TURN_SILENCE_S = 6.0  # after a wake, the mic closes when the turn ends or after this much silence
+# True: after a wake phrase, "unblur everything" and "unblur everyone" wait for a spoken yes, so a
+# false wake cannot reveal anything. The lead turned it off at 16:55 for a smoother demo.
+WAKE_REVEAL_NEEDS_YES = False
 WAKE_TONE_HZ = 880
 WAKE_TONE_S = 0.12
 AGENT_REPLY_MAX_WORDS = 8
