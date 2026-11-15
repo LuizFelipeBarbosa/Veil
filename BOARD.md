@@ -25,7 +25,7 @@ Milestones: 13:00 faces blurred (Mac) | 14:00 owner + signs/plates | 14:45 voice
 | 22 | Replaced ads too jittery: one drawing per sign, state by position, motion filter | merged; lead to re-watch | 15:07– | wp22-ad-smooth | lead: re-watch ad.mp4 |
 | 23 | Ads: stale ad after a scene cut, sliding, glass/occluders | merged 15:36; cut fixed, glass only partly (needs masks) | 15:23–15:31 | wp23-ad-cuts-occlusion | lead: re-watch; panel blurred as a sign after the cut |
 | 25 | Ads: never stacked, placed by optical flow instead of the detector box | running, due 16:15 | 15:47– | wp25-ad-flow | freeze extended to 16:30 by the lead for WP25/WP26 only |
-| 26 | Ghost faces on the bus-stop advert | running, due 16:12 | 15:47– | wp26-ghost-faces | dropped if not clearly better by 16:30 |
+| 26 | Ghost faces on the bus-stop advert: rotated passes firing on printed ads | merged 16:03 (lead accepted the recall trade) | 15:47–16:00 | wp26-ghost-faces | a face turned past 90° beside a sure upright face can be missed |
 | 8 | Integration (orchestrator) | all threads wired 12:03; live voice test pending | 12:03– | main | lead: hold T and speak |
 | 9 | Pi port (orchestrator + lead) | queued | 14:45–15:30 | main | needs WP8, the Pi |
 | 10 | Leak review (read-only) | done 15:36: no pixel leak; analytics, backfill, mic tail, debug-log fixes merged | 15:23–15:36 | — | residual: swap exposure ~0.9 s, sign labelled as ad is shown |
