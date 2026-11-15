@@ -53,7 +53,7 @@ def main() -> None:
 
     def transcript_opacity() -> float:
         """1 while Talk is held and for a while after the last line, then down to 0."""
-        if talk_held.is_set():
+        if talk_held.is_set() or voice.mic_live:
             return 1.0
         fading_for = time.monotonic() - last_line_at[0] - config.TRANSCRIPT_VISIBLE_S
         return min(1.0, max(0.0, 1.0 - fading_for / config.TRANSCRIPT_FADE_S))
@@ -98,7 +98,7 @@ def main() -> None:
             recording_s=recorder.elapsed_s,
             fail_closed=latest is None or latest.fail_closed,
             panic=policy.snapshot().panic,
-            talking=talk_held.is_set(),
+            talking=talk_held.is_set() or voice.mic_live,  # lit whenever mic audio is being sent
             transcript=tuple(transcript) if opacity > 0 else (),  # gone: the pointing hint comes back
             transcript_opacity=opacity,
             ad=Path(next(iter(policy.snapshot().replacements.values()), "")).stem,

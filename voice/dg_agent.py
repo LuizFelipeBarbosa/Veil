@@ -1,6 +1,8 @@
 """Deepgram Voice Agent socket, Settings, mic gate and playback (WP7).
 
-Mic audio is sent only while Talk is held.
+Mic audio is sent only while Talk is held, or between a wake phrase detected on the device
+(voice/wake.py) and the end of that turn. Before the wake phrase, audio is only fed to the
+on-device detector in memory: never stored, sent or logged.
 
 Speaks the Voice Agent websocket protocol directly (plain JSON over the
 `websockets` package that deepgram-sdk already depends on), because the SDK's
@@ -14,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import queue
 import threading
@@ -23,10 +26,13 @@ from typing import Any, Callable, Sequence
 
 import config
 from contracts import AD_CLASSES, KNOWN_CLASSES, TOOL_SCHEMAS
+from voice.confirm import NEEDS_CONFIRMATION, Confirmations
 from voice.tools import KEYWORD_REPLIES, NO_AD_IMAGES, ToolHandlers, parse_keywords
+from voice.wake import WakeDetector, WakeUnavailable, panic_spotter
 
 # role is "you" or "agent"
 OnTranscript = Callable[[str, str], None]
+OnMicLive = Callable[[bool], None]
 
 _log = logging.getLogger(__name__)
 
@@ -35,6 +41,9 @@ _KEEPALIVE_S = 5.0
 _MIC_BLOCK = config.MIC_SAMPLE_RATE // 20  # 50 ms of audio per send
 _TRANSCRIPT_WAIT_S = 10.0  # after release, give up waiting for the user transcript
 _RECONNECT_DELAYS_S = (1.0, 2.0, 5.0, 10.0)
+_TTS_DEAF_S = 0.3  # the wake detector stays deaf this long after the agent's own audio ends
+# Deepgram messages that mean the user's turn is over: a wake turn stops sending here.
+_END_OF_USER_TURN = ("AgentThinking", "AgentStartedSpeaking", "EndOfTurn")
 
 _COMMANDS_PROMPT = f"""\
 You are the voice control of a handheld privacy camera. You change what it blurs only by
@@ -194,6 +203,7 @@ class VoiceAgent(threading.Thread):
         use_audio: bool = True,
         *,
         keyword_fallback_s: float | None = config.KEYWORD_FALLBACK_S,
+        on_mic_live: OnMicLive | None = None,
         **settings_overrides: Any,
     ) -> None:
         """settings_overrides go to build_settings (think_model, think_provider, temperature,
@@ -201,6 +211,8 @@ class VoiceAgent(threading.Thread):
 
         keyword_fallback_s=None turns the keyword fallback off (scripts/voice_check.py
         uses that to measure the model alone).
+        on_mic_live(bool) is called, from any thread, when mic audio starts or stops leaving
+        the device (Talk held or a wake turn open).
         """
         super().__init__(name="voice", daemon=True)
         self._handlers = handlers
@@ -225,18 +237,42 @@ class VoiceAgent(threading.Thread):
         self._turn: _Turn | None = None
         self._speaker = _Speaker() if use_audio else None
 
+        # Wake phrase. The always-on stream feeds the detector while idle; a wake opens a
+        # turn that sends like a Talk hold. All of it is guarded by _talk_lock.
+        self._wake: WakeDetector | None = None
+        self._wake_mic: Any = None  # the continuous stream, only when the detector loaded
+        self._panic: WakeDetector | None = None  # on-device panic words for an offline wake turn
+        self._wake_turn_open = False
+        self._wake_turn_offline = False
+        self._wake_opened_at = 0.0
+        self._on_mic_live = on_mic_live
+        self._mic_live_shown = False
+        # Loop-side: the current user turn began with the wake phrase, so reveals need a yes.
+        self._turn_began_with_wake = False
+        self._confirmations = Confirmations()
+
     # --- public, safe from any thread -----------------------------------------
+
+    @property
+    def mic_live(self) -> bool:
+        """True while mic audio is leaving the device: Talk held or a wake turn open."""
+        with self._talk_lock:
+            return self._talk_held or self._wake_turn_open
 
     def set_talking(self, pressed: bool) -> None:
         """Press opens the mic gate; release closes it and sends ForceEndTurn. Safe from any thread.
 
         The gate closes before this returns, without waiting for the loop: a mic block that
         arrives after release is dropped. Blocks captured while held still go out, ahead of
-        ForceEndTurn, so the end of the utterance is not cut.
+        ForceEndTurn, so the end of the utterance is not cut. A press during a wake turn takes
+        the turn over.
         """
         with self._talk_lock:
             self._talk_held = bool(pressed)
+            if pressed:
+                self._wake_turn_open = False
             self._call_on_loop(self._set_talking, bool(pressed))
+        self._notify_mic_live()
 
     def inject_text(self, text: str) -> None:
         """Send a typed command as InjectUserMessage (tests and the no-mic path)."""
@@ -254,8 +290,11 @@ class VoiceAgent(threading.Thread):
     def run(self) -> None:
         asyncio.set_event_loop(self._loop)
         try:
+            if self._use_audio and config.WAKE_PHRASE_ENABLED:
+                self._start_wake_listening()
             self._loop.run_until_complete(self._run_forever())
         finally:
+            self._stop_wake_listening()
             self._close_mic()
             if self._speaker:
                 self._speaker.close()
@@ -358,6 +397,8 @@ class VoiceAgent(threading.Thread):
 
     def _dispatch(self, message: dict[str, Any]) -> None:
         kind = message.get("type")
+        if kind in _END_OF_USER_TURN:
+            self._close_wake_turn()
         if kind == "SettingsApplied":
             self._ready.set()
         elif kind == "FunctionCallRequest":
@@ -383,7 +424,7 @@ class VoiceAgent(threading.Thread):
             if self._turn:
                 self._turn.tool_called = True
             name = str(call.get("name", ""))
-            result = self._handlers.handle(name, _parse_arguments(call.get("arguments")))
+            result = self._handle_tool(name, _parse_arguments(call.get("arguments")))
             response = {"type": "FunctionCallResponse", "id": call.get("id"), "name": name, "content": json.dumps(result)}
             self._outbox.put_nowait(json.dumps(response))
 
@@ -391,9 +432,11 @@ class VoiceAgent(threading.Thread):
         if role == "user":
             if self._turn and self._turn.user_text == content:
                 return  # the echo of our own InjectUserMessage, already shown
+            self._close_wake_turn()  # the transcript means the user's turn ended
             if self._turn:
                 self._turn.user_text = content
             self._say("you", content)
+            self._run_confirmed_call(content)
         elif role == "assistant":
             self._say("agent", content)
 
@@ -408,10 +451,13 @@ class VoiceAgent(threading.Thread):
                 return
             self._talking = True
             self._turn = None
+            self._turn_began_with_wake = False
             if self._speaker:
                 self._speaker.flush()
+            if self._wake_mic is not None:
+                return  # the wake stream is already running; the gate in _on_mic_block sends
             try:
-                self._open_mic()
+                self._mic = _open_input_stream(self._on_mic_block)
             except Exception as error:  # noqa: BLE001 - no mic: say so, stay closed
                 self._talking = False
                 self._say("agent", f"Mic error: {type(error).__name__}")
@@ -432,33 +478,136 @@ class VoiceAgent(threading.Thread):
             return
         self._say("you", text)
         self._turn = _Turn(ended_at=time.monotonic(), user_text=text)
+        self._turn_began_with_wake = False
+        self._run_confirmed_call(text)
         if not self._ready.is_set():
             self._run_keyword_fallback()  # offline: class and panic commands still work
             return
         self._outbox.put_nowait(json.dumps({"type": "InjectUserMessage", "content": text}))
 
-    def _open_mic(self) -> None:
-        import sounddevice  # only here: no audio device is needed for the text path
-
-        def on_audio(data: Any, frames: int, time_info: Any, status: Any) -> None:
-            with self._talk_lock:  # the gate, on PortAudio's thread; see set_talking
-                if self._talk_held:
-                    self._call_on_loop(self._outbox.put_nowait, bytes(data))
-
-        self._mic = sounddevice.RawInputStream(
-            samplerate=config.MIC_SAMPLE_RATE, channels=1, dtype="int16", blocksize=_MIC_BLOCK, callback=on_audio
-        )
-        self._mic.start()
-
     def _close_mic(self) -> None:
         mic, self._mic = self._mic, None
-        if mic is None:
+        _close_stream(mic)
+
+    # --- mic gate and wake phrase -------------------------------------------------------
+
+    def _on_mic_block(self, block: bytes, now: float) -> None:
+        """Every mic block, on PortAudio's thread (tests call it directly).
+
+        Sends only while Talk is held or a wake turn is open. Otherwise the block goes to the
+        on-device wake detector and is dropped: never stored, sent or logged.
+        """
+        with self._talk_lock:  # the gate; see set_talking
+            if self._talk_held:
+                self._call_on_loop(self._outbox.put_nowait, block)
+            elif self._wake_turn_open:
+                self._wake_turn_block(block, now)
+            elif self._wake is not None:
+                self._listen_for_wake(block, now)
+        self._notify_mic_live()
+
+    def _wake_turn_block(self, block: bytes, now: float) -> None:
+        """Holds _talk_lock. Sends the block, or spots panic words on the device when offline."""
+        if now - self._wake_opened_at >= config.WAKE_TURN_SILENCE_S:
+            self._wake_turn_open = False
+            self._call_on_loop(self._wake_turn_timed_out, self._wake_turn_offline)
+        elif not self._wake_turn_offline:
+            self._call_on_loop(self._outbox.put_nowait, block)
+        elif self._panic is not None and self._panic.feed(block):
+            self._wake_turn_open = False
+            self._call_on_loop(self._offline_panic)
+
+    def _listen_for_wake(self, block: bytes, now: float) -> None:
+        """Holds _talk_lock. The agent's own voice must not wake it: deaf while it plays."""
+        assert self._wake is not None
+        if self._speaker and self._speaker.busy(now, _TTS_DEAF_S):
+            self._wake.reset()
             return
+        if not self._wake.feed(block):
+            return
+        # The block that completed the phrase is not sent: only blocks after it.
+        self._wake_turn_open = True
+        self._wake_opened_at = now
+        self._wake_turn_offline = not self._ready.is_set()
+        if self._wake_turn_offline and self._panic is not None:
+            self._panic.reset()
+        self._call_on_loop(self._on_wake, self._wake_turn_offline)
+
+    def _on_wake(self, offline: bool) -> None:
+        self._turn = None
+        self._turn_began_with_wake = True
+        if self._speaker:
+            self._speaker.flush()
+            self._speaker.play(_wake_tone())
+        if offline:
+            self._say("agent", "Voice offline: only panic works")
+
+    def _close_wake_turn(self) -> None:
+        """Deepgram says the user's turn is over: stop sending. No ForceEndTurn needed."""
+        with self._talk_lock:
+            was_open, self._wake_turn_open = self._wake_turn_open, False
+        if was_open:
+            self._turn = _Turn(ended_at=time.monotonic())
+            self._notify_mic_live()
+
+    def _wake_turn_timed_out(self, offline: bool) -> None:
+        if offline:
+            self._say("agent", "Voice offline")
+        else:
+            self._end_turn()  # the blocks already queued go out ahead of it
+
+    def _offline_panic(self) -> None:
+        result = self._handlers.handle("blur_all", {})
+        _log.info("offline wake panic -> %s", result)
+        self._say("agent", "Done." if result.get("ok") else "Couldn't do that.")
+
+    def _notify_mic_live(self) -> None:
+        with self._talk_lock:
+            live = self._talk_held or self._wake_turn_open
+            changed, self._mic_live_shown = live != self._mic_live_shown, live
+        if changed and self._on_mic_live is not None:
+            try:
+                self._on_mic_live(live)
+            except Exception:  # noqa: BLE001 - a UI bug must not take the mic thread down
+                _log.exception("on_mic_live failed")
+
+    def _start_wake_listening(self) -> None:
+        """Load the detector and open the always-on stream. Any failure: no listening, Talk works."""
         try:
-            mic.stop()
-            mic.close()
-        except Exception as error:  # noqa: BLE001
-            _log.warning("closing the mic failed: %s", error)
+            self._wake = WakeDetector()
+            self._panic = panic_spotter()
+            self._wake_mic = _open_input_stream(self._on_mic_block)
+        except Exception as error:  # noqa: BLE001 - WakeUnavailable, no mic: fail closed
+            self._wake = None
+            self._panic = None
+            message = str(error) if isinstance(error, WakeUnavailable) else f"Wake phrase off ({type(error).__name__})"
+            _log.warning("%s", message)
+            self._say("agent", message)
+
+    def _stop_wake_listening(self) -> None:
+        stream, self._wake_mic = self._wake_mic, None
+        _close_stream(stream)
+        with self._talk_lock:
+            self._wake = None
+            self._wake_turn_open = False
+
+    # --- confirmation of reveals after a wake -------------------------------------------
+
+    def _handle_tool(self, name: str, arguments: Any) -> dict[str, Any]:
+        if self._confirmations.needs_confirmation(name, arguments, self._turn_began_with_wake):
+            self._confirmations.hold(name, arguments, time.monotonic())
+            return NEEDS_CONFIRMATION
+        return self._handlers.handle(name, arguments)
+
+    def _run_confirmed_call(self, transcript: str) -> None:
+        """A user turn after a held reveal: run it if the turn is a yes, else drop it."""
+        call = self._confirmations.confirm(transcript, time.monotonic())
+        if call is None:
+            return
+        if self._turn:
+            self._turn.tool_called = True
+        result = self._handlers.handle(*call)
+        _log.info("confirmed %s -> %s", call[0], result)
 
     # --- keyword fallback -------------------------------------------------------------
 
@@ -484,12 +633,14 @@ class VoiceAgent(threading.Thread):
             return
         errors = []
         for name, arguments in calls:
-            result = self._handlers.handle(name, arguments)
+            result = self._handle_tool(name, arguments)  # a reveal after a wake waits for a yes
             _log.info("keyword fallback %s %s -> %s", name, arguments, result)
             if not result.get("ok"):
                 errors.append(result.get("error"))
         if not errors:
             self._say("agent", KEYWORD_REPLIES.get(calls[-1][0], "Done."))
+        elif self._confirmations.pending is not None:
+            self._say("agent", NEEDS_CONFIRMATION["say"])
         else:
             self._say("agent", NO_AD_IMAGES if NO_AD_IMAGES in errors else "Couldn't do that.")
 
@@ -501,12 +652,20 @@ class _Speaker:
         self._chunks: queue.Queue[bytes | None] = queue.Queue()
         self._thread = threading.Thread(target=self._run, name="voice-speaker", daemon=True)
         self._thread.start()
+        self._playing_until = 0.0  # monotonic time the queued audio should finish playing
 
     def play(self, chunk: bytes) -> None:
+        now = time.monotonic()
+        self._playing_until = max(now, self._playing_until) + len(chunk) / (2 * config.SPEAKER_SAMPLE_RATE)
         self._chunks.put(chunk)
+
+    def busy(self, now: float, tail_s: float) -> bool:
+        """True while agent audio plays and for tail_s after (the wake detector stays deaf)."""
+        return now < self._playing_until + tail_s
 
     def flush(self) -> None:
         _drain(self._chunks)
+        self._playing_until = min(self._playing_until, time.monotonic())
 
     def close(self) -> None:
         self.flush()
@@ -536,6 +695,43 @@ class _Speaker:
         finally:
             if stream is not None:
                 stream.close()
+
+
+def _open_input_stream(on_block: Callable[[bytes, float], None]) -> Any:
+    """A started 16 kHz mono int16 mic stream, 50 ms blocks, each passed to on_block(block, now)."""
+    import sounddevice  # only here: no audio device is needed for the text path
+
+    def on_audio(data: Any, frames: int, time_info: Any, status: Any) -> None:
+        on_block(bytes(data), time.monotonic())
+
+    stream = sounddevice.RawInputStream(
+        samplerate=config.MIC_SAMPLE_RATE, channels=1, dtype="int16", blocksize=_MIC_BLOCK, callback=on_audio
+    )
+    stream.start()
+    return stream
+
+
+def _close_stream(stream: Any) -> None:
+    if stream is None:
+        return
+    try:
+        stream.stop()
+        stream.close()
+    except Exception as error:  # noqa: BLE001
+        _log.warning("closing the mic failed: %s", error)
+
+
+def _wake_tone() -> bytes:
+    """A short sine beep at the speaker rate, int16, with 10 ms fades so it doesn't click."""
+    rate = config.SPEAKER_SAMPLE_RATE
+    count = int(rate * config.WAKE_TONE_S)
+    fade = max(1, rate // 100)
+    samples = bytearray()
+    for i in range(count):
+        envelope = min(1.0, i / fade, (count - 1 - i) / fade)
+        value = int(0.3 * 32767 * envelope * math.sin(2 * math.pi * config.WAKE_TONE_HZ * i / rate))
+        samples += value.to_bytes(2, "little", signed=True)
+    return bytes(samples)
 
 
 def _parse_arguments(arguments: Any) -> Any:
