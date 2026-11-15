@@ -41,3 +41,4 @@ Public repo `Veil` created and main pushed 16:16 (author address rewritten to th
 Code reopened by the lead for hands-free work; hard stop for code 17:00. No push until the lead says.
 WP32 merged 16:58: yes confirmation after a wake phrase is behind config.WAKE_REVEAL_NEEDS_YES, off by the lead's choice.
 WP31 merged 17:06 (lead approved after the code stop): ads take the old poster's tone, softened, grained, feathered, aspect kept. Not fixed: ad over a person in front, jitter and snaps.
+WP31 follow-up merged 17:18: re-locks glide instead of jumping, sign keeps its shape without a quad, photos cropped to the panel. 537 pass.
