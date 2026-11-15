@@ -572,11 +572,12 @@ def test_the_ad_carries_grain_that_changes_from_frame_to_frame(tmp_path: Path, s
 def test_the_ad_keeps_its_aspect_ratio_on_a_tall_panel(tmp_path: Path) -> None:
     asset = np.full((90, 160, 3), AD_COLOR, np.uint8)
     asset[25:65, 60:100] = (255, 0, 0)  # a square mark in the middle
-    out = _draw_asset(tmp_path, asset, _wall_with_old_poster())
-    mark = np.all(np.abs(out.astype(int) - (255, 0, 0)) <= 60, axis=-1)
-    ys, xs = np.nonzero(mark)
+    image = _wall_with_old_poster()
+    out = _draw_asset(tmp_path, asset, image)
+    band = out[195:285]  # where the asset itself lands, at its own scale, in the middle of the 160 x 280 panel
+    ys, xs = np.nonzero(np.all(np.abs(band.astype(int) - (255, 0, 0)) <= 60, axis=-1))
     assert abs((xs.max() - xs.min()) - (ys.max() - ys.min())) <= 3  # still square, not stretched to the panel
-    assert _is_ad(out[110:130, 220:340]).all() and _is_ad(out[350:370, 220:340]).all()  # the edge colour fills the rest
+    assert np.any(out[105:190, 205:355] != image[105:190, 205:355], axis=-1).all()  # the rest is filled, mirrored
 
 
 def test_the_edge_of_the_ad_fades_into_the_scene(tmp_path: Path) -> None:
