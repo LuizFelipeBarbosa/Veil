@@ -68,15 +68,17 @@ def main() -> None:
         return next(iter(policy.snapshot().replacements.values()), None)
 
     def cycle_ad() -> None:
-        """Key A: off -> first ad image -> next -> ... -> off, for every ad class at once."""
-        current = current_ad()
-        following = ad_assets[ad_assets.index(current) + 1 :] if current in ad_assets else ad_assets
+        """The Ads button and key A: one switch, on or off, for every ad class at once.
+
+        On uses the first image; signs seen together then get the following images (vision/replace.py).
+        """
+        turn_on = current_ad() is None and bool(ad_assets)
         for label in AD_CLASSES:
-            if following:
-                policy.set_replacement(label, following[0])
+            if turn_on:
+                policy.set_replacement(label, ad_assets[0])
             else:
                 policy.set_class_rule(label, "show")
-        log.info("ads: %s", following[0] if following else "not replaced")
+        log.info("ads: %s", "replaced" if turn_on else "not replaced")
 
     def toggle_recording() -> None:
         if recorder.is_recording:

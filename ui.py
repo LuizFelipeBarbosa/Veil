@@ -8,7 +8,7 @@ the Mac keys; the layout scales to any landscape window from 480x320 up.
 Tapping a face or object on the preview reports the frame pixel under the tap
 (on_point). Outlines show what can be pointed at and whether it is blurred, shown
 or a replaced ad; they are drawn on the screen only, never into the frame (Never-leaks rule 9).
-The Ad button and config.KEY_CYCLE_AD step through the ad images, then off.
+The Ads button and config.KEY_CYCLE_AD turn ad replacement on or off.
 """
 
 from __future__ import annotations
@@ -567,10 +567,10 @@ def _draw_owner_button(screen: pygame.Surface, layout: _Layout, status: UiStatus
 
 
 def _draw_ad_button(screen: pygame.Surface, layout: _Layout, status: UiStatus, controls: _Controls) -> None:
-    """Each press goes to the next ad image, then off. Lit, with the image's name, while ads are replaced."""
+    """One switch: a press turns ad replacement on or off. Lit while ads are replaced."""
     rect = layout.buttons["ad"]
     if status.ad:
-        _draw_button(screen, layout, rect, f"Ad: {status.ad}", _OWNER_SET_BG, controls.is_held("ad"))
+        _draw_button(screen, layout, rect, "Ads on", _OWNER_SET_BG, controls.is_held("ad"))
     else:
         _draw_button(screen, layout, rect, "Ads", _BUTTON_BG, controls.is_held("ad"))
 
