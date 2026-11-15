@@ -30,6 +30,7 @@ Milestones: 13:00 faces blurred (Mac) | 14:00 owner + signs/plates | 14:45 voice
 | 9 | Pi port (orchestrator + lead) | queued | 14:45–15:30 | main | needs WP8, the Pi |
 | 10 | Leak review (read-only) | done 15:36: no pixel leak; analytics, backfill, mic tail, debug-log fixes merged | 15:23–15:36 | — | residual: swap exposure ~0.9 s, sign labelled as ad is shown |
 | 24 | Mic audio sent for ~120 ms after Talk release | merged 15:45 | 15:37–15:41 | wp24-mic-tail | — |
-| 11 | README and Devpost text | running, due 16:50 | 16:09– | wp11-readme | lead edits and submits |
+| 11 | README and Devpost text | merged 16:13 | 16:09–16:13 | wp11-readme | lead: fill TODO(lead), edit, submit |
+| 27 | Each sign in view shows a different ad image | running, due 16:28 | 16:11– | wp27-different-ads | README needs one line if merged |
 
 Code frozen 16:08 (lead: stop at ad occlusion). After this: bug fixes and config.py only.
