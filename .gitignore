@@ -11,3 +11,13 @@ weights/
 tests/data/*.mov
 tests/data/*.MOV
 tests/data/ad.mp4
+
+# Added before the public push (leak review finding 9)
+.env.*
+tests/data/*
+!tests/data/synthetic.mp4
+*.avi
+*.ts
+*.ncnn.param
+*.ncnn.bin
+.claude/settings.local.json
