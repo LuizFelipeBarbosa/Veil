@@ -32,6 +32,15 @@ _COVERED_SHARE = 0.7
 # hits on facades scored at most 0.65 (640x480) / 0.70 (320x240); on rotated crossing.mov faces,
 # 0.75 dropped recall at 320x240 to 0.90 at 45 and -135 degrees, 0.7 kept it at 0.91 or better.
 _ROTATED_ONLY_SCORE = 0.7
+# Passes that look for faces turned more than 90 degrees from upright, near upside down (WP26).
+# When the upright pass finds a face this sure, the camera is held upright and every face in the
+# scene shares its "up", so these passes are skipped. On ad.mp4 they put 0.70-0.81 hits on the
+# printed adverts (the bus-shelter panel at 120 degrees in about one frame in two) while the
+# speaker's upright face scored 0.94-0.95. The upright pass also finds faces turned 180 degrees,
+# at up to 0.92 on crossing.mov (0.86 at 135), so a lower bar would wrongly skip these passes
+# when the camera itself is upside down.
+_UPSIDE_DOWN_PASSES = frozenset({120, 180, 240})
+_UPRIGHT_SCENE_SCORE = 0.93
 # cv2.rotate codes for the exact quarter turns; any other angle goes through warpAffine.
 _QUARTER_TURNS = {90: cv2.ROTATE_90_COUNTERCLOCKWISE, 180: cv2.ROTATE_180, 270: cv2.ROTATE_90_CLOCKWISE}
 
@@ -62,8 +71,11 @@ class FaceDetector:
         """
         height, width = image.shape[:2]
         upright = self._detect_rows(image)
+        camera_upright = bool(len(upright)) and float(upright[:, _SCORE_COLUMN].max()) >= _UPRIGHT_SCENE_SCORE
         rows = [upright]
         for angle in self._rotations_this_call():
+            if camera_upright and angle in _UPSIDE_DOWN_PASSES:
+                continue
             rotated, to_rotated = _rotate(image, angle)
             mapped = _map_rows(self._detect_rows(rotated), cv2.invertAffineTransform(to_rotated))
             rows.append(_without_phantoms(mapped, upright))

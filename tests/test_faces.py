@@ -383,3 +383,24 @@ def test_rotated_passes_round_robin_and_cover_every_angle() -> None:
     assert calls == [[60, 180], [300, 120], [240, 60], [180, 300], [120, 240]]
     assert {angle for call in calls[:3] for angle in call} == {60, 180, 300, 120, 240}
     assert FaceDetector(rotations_per_call=None)._rotations_this_call() == list(_ROTATIONS)
+
+
+@pytest.mark.parametrize(("upright_score", "passes_run"), [(0.95, 3), (0.92, 6), (None, 6)])
+def test_upside_down_passes_are_skipped_only_beside_a_sure_upright_face(monkeypatch, upright_score, passes_run) -> None:
+    """WP26: a sure upright face means the camera is upright, so the 120/180/240 passes (which put
+    ghost faces on adverts) are skipped; 60 and 300 still run. A face turned 180 degrees can score
+    0.92 upright, so below the bar every pass runs."""
+    detector = FaceDetector(rotations_per_call=None)
+    upright = np.empty((0, 15), dtype=np.float32)
+    if upright_score is not None:
+        upright = np.array([[100, 100, 50, 60, 110, 120, 140, 120, 125, 135, 112, 150, 138, 150, upright_score]],
+                           dtype=np.float32)
+    calls: list[int] = []
+
+    def fake_rows(image: np.ndarray) -> np.ndarray:
+        calls.append(1)
+        return upright if len(calls) == 1 else np.empty((0, 15), dtype=np.float32)
+
+    monkeypatch.setattr(detector, "_detect_rows", fake_rows)
+    detector.detect(np.zeros((480, 640, 3), dtype=np.uint8))
+    assert len(calls) == passes_run
